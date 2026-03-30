@@ -1,0 +1,52 @@
+# bilbycast-appear-x-api-gateway configuration
+
+[manager]
+# WebSocket URL for bilbycast-manager (must be wss://)
+url = "wss://manager.example.com:8443/ws/node"
+
+# One-time registration token (from manager's "Add Node" with device_type=appear_x)
+# After first registration this is no longer needed — credentials are saved to credentials_file
+registration_token = "your-registration-token-here"
+
+# Where to store node_id + node_secret after registration
+credentials_file = "credentials.json"
+
+# Accept self-signed TLS certificates for manager connection
+# Requires BILBYCAST_ALLOW_INSECURE=1 environment variable as safety guard
+accept_self_signed_cert = false
+
+# Optional: SHA-256 certificate fingerprint for cert pinning (colon-separated hex)
+# cert_fingerprint = "ab:cd:ef:..."
+
+[appear_x]
+# IP address or hostname of the Appear X unit
+address = "192.168.1.100"
+
+# Login credentials for the Appear X JSON-RPC API
+username = "admin"
+password = ""
+
+# Appear X units typically use self-signed HTTPS certificates
+accept_self_signed_cert = true
+
+[polling]
+# Polling intervals in seconds
+alarms_interval_secs = 10
+chassis_interval_secs = 30
+inputs_interval_secs = 15
+outputs_interval_secs = 15
+services_interval_secs = 30
+
+# Board slots to monitor
+# Each board is polled for inputs, outputs, services, and IP interfaces
+
+[[polling.boards]]
+slot = 1
+interface = "ipGateway"
+api_version = "1.15"
+
+# Add more boards as needed:
+# [[polling.boards]]
+# slot = 2
+# interface = "ipGateway"
+# api_version = "1.15"
