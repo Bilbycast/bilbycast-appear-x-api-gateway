@@ -1,15 +1,26 @@
-/target
-*.key
-*.pub
-*.license
+# Build artifacts
+/target/
+**/*.rs.bk
 
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDEs
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
 .claude/
 
-# Secrets & credentials — NEVER commit these
+# Environment & secrets
 .env
-.env.local
-.env.production
+.env.*
 *.pem
 *.key
 *.crt
@@ -19,3 +30,10 @@ certs/
 tls/
 *-credentials.json
 *-credentials.toml
+
+# Logs
+*.log
+
+# Project-specific
+*.license
+*.pub
