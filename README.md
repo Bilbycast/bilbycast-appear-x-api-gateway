@@ -1,5 +1,7 @@
 # bilbycast-appear-x-api-gateway
 
+> 🌐 Learn more at **[bilbycast.com](https://bilbycast.com)** — the official website for the Bilbycast broadcast media transport suite.
+
 API gateway sidecar that bridges the [Appear X](https://www.appear.net/) broadcast encoder/gateway platform to bilbycast-manager. Connects to the manager as a WebSocket client (same protocol as edge/relay nodes) and communicates with the Appear X unit via its JSON-RPC 2.0 API over HTTPS.
 
 This project serves as the **reference implementation** for integrating 3rd-party broadcast devices into the bilbycast ecosystem.
