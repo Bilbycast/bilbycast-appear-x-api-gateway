@@ -60,37 +60,39 @@ pub struct PollingConfig {
     pub inputs_interval_secs: u64,
     #[serde(default = "default_15")]
     pub outputs_interval_secs: u64,
+    /// MMI interface version used for alarms calls (e.g. "2.8", "2.16").
+    /// Different Appear firmware versions expose different MMI interface versions.
+    #[serde(default = "default_alarms_mmi_version")]
+    pub alarms_mmi_version: String,
+    /// MMI interface version used for chassisModel calls (e.g. "4.1", "2.16").
+    #[serde(default = "default_chassis_mmi_version")]
+    pub chassis_mmi_version: String,
+    /// MMI interface version used for `cards/*` calls (GetChassisInfo, GetCardStates).
+    #[serde(default = "default_cards_mmi_version")]
+    pub cards_mmi_version: String,
+    /// Polling interval (seconds) for `cards/GetChassisInfo` + `cards/GetCardStates`.
     #[serde(default = "default_30")]
-    pub services_interval_secs: u64,
-    /// Board slots to monitor
-    #[serde(default)]
-    pub boards: Vec<BoardConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BoardConfig {
-    pub slot: u32,
-    #[serde(default = "default_ip_gateway")]
-    pub interface: String,
-    #[serde(default = "default_api_version")]
-    pub api_version: String,
+    pub cards_interval_secs: u64,
 }
 
 fn default_10() -> u64 { 10 }
 fn default_15() -> u64 { 15 }
 fn default_30() -> u64 { 30 }
-fn default_ip_gateway() -> String { "ipGateway".into() }
-fn default_api_version() -> String { "1.15".into() }
+fn default_alarms_mmi_version() -> String { "2.8".into() }
+fn default_chassis_mmi_version() -> String { "4.1".into() }
+fn default_cards_mmi_version() -> String { "2.8".into() }
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Load the config, optionally skipping the manager URL validation.
+    /// `skip_manager_validation = true` is used by the `probe` subcommand,
+    /// which talks only to the Appear X unit and never connects to the manager.
+    pub fn load_for_command(path: &Path, skip_manager_validation: bool) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         let config: AppConfig = toml::from_str(&contents)
             .with_context(|| "Failed to parse TOML configuration")?;
 
-        // Validate
-        if !config.manager.url.starts_with("wss://") {
+        if !skip_manager_validation && !config.manager.url.starts_with("wss://") {
             anyhow::bail!(
                 "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed."
             );

@@ -35,18 +35,25 @@ alarms_interval_secs = 10
 chassis_interval_secs = 30
 inputs_interval_secs = 15
 outputs_interval_secs = 15
-services_interval_secs = 30
+cards_interval_secs = 30
 
-# Board slots to monitor
-# Each board is polled for inputs, outputs, services, and IP interfaces
+# MMI interface versions for the chassis-level endpoints. These vary across
+# Appear firmware versions; the gateway logs "Method '...' was not found" if
+# the configured version is wrong. Known-working values for the X5/X20 demo
+# firmware tested 2026-04: alarms 2.8 / chassis 4.1 / cards 2.8.
+alarms_mmi_version = "2.8"
+chassis_mmi_version = "4.1"
+cards_mmi_version = "2.8"
 
-[[polling.boards]]
-slot = 1
-interface = "ipGateway"
-api_version = "1.15"
-
-# Add more boards as needed:
-# [[polling.boards]]
-# slot = 2
-# interface = "ipGateway"
-# api_version = "1.15"
+# NOTE: There is no per-board configuration. On startup the gateway runs a
+# capability discovery pass against the unit (see src/appear_x/capabilities.rs)
+# which:
+#   1. Reads `cards/GetChassisInfo` to learn the chassis type (X5/X10/X20) and
+#      the per-slot card name, serial, software_id, version, and feature list.
+#   2. For each populated slot, probes the registry in
+#      `src/appear_x/probe_registry.rs` to find which JSON-RPC interface
+#      families this firmware actually exposes.
+# Polling tasks are then spawned only for what discovery confirmed works, so
+# slots whose card software uses an unknown namespace silently report through
+# chassis-level polls only (alarms / chassisModel / cards) instead of spamming
+# "Method not found" against unsupported endpoints.

@@ -1,0 +1,22 @@
+# Probe-only config for the Appear X5 demo unit at 192.168.50.8.
+# Use with: cargo run -- --config config/probe-x5.toml probe
+#
+# The manager section is required by the loader but unused in `probe` mode,
+# which talks only to the Appear X unit and skips the wss:// URL validation.
+
+[manager]
+url = "unused-in-probe-mode"
+registration_token = ""
+credentials_file = "credentials.json"
+
+[appear_x]
+address = "192.168.50.8"
+username = "admin"
+password = "demo"
+accept_self_signed_cert = true
+
+[polling]
+alarms_mmi_version = "2.8"
+chassis_mmi_version = "4.1"
+cards_mmi_version = "2.8"
+# Per-slot polling is fully discovered at runtime — no boards block needed.

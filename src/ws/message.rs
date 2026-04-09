@@ -60,6 +60,15 @@ pub fn health_message(payload: serde_json::Value) -> String {
     ws_envelope("health", payload)
 }
 
+/// Build a config_response message. The manager populates its `cached_config`
+/// only when this message type arrives — `command_ack.data` from a `get_config`
+/// command is NOT used for that purpose. The manager stores `envelope.payload`
+/// directly as `cached_config` and the API returns it as-is, so the payload
+/// must be the bare config object (no wrapping).
+pub fn config_response_message(config: serde_json::Value) -> String {
+    ws_envelope("config_response", config)
+}
+
 /// Build a command acknowledgment.
 pub fn command_ack(command_id: &str, success: bool, data: Option<serde_json::Value>, error: Option<&str>) -> String {
     let mut payload = json!({
@@ -73,6 +82,11 @@ pub fn command_ack(command_id: &str, success: bool, data: Option<serde_json::Val
         payload["error"] = json!(e);
     }
     ws_envelope("command_ack", payload)
+}
+
+/// Build an event message for the manager's Events system.
+pub fn event_message(payload: serde_json::Value) -> String {
+    ws_envelope("event", payload)
 }
 
 /// Build a pong response.

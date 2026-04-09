@@ -203,6 +203,18 @@ async fn try_connect(
 
                 let ws_msg = match msg_type {
                     "health" => message::health_message(payload),
+                    "event" => message::event_message(payload),
+                    "config_response" => {
+                        // The command handler sends the consolidated state
+                        // snapshot through this channel when the manager
+                        // issues a `get_config` command. Strip our internal
+                        // wrapper key and forward as a real config_response.
+                        let config = payload
+                            .get("config")
+                            .cloned()
+                            .unwrap_or(payload);
+                        message::config_response_message(config)
+                    }
                     _ => message::stats_message(payload),
                 };
                 if let Err(e) = write.send(Message::Text(ws_msg.into())).await {
