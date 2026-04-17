@@ -99,6 +99,11 @@ Options:
 - Credentials file written with `0600` permissions
 - Appear X HTTPS settings are independent of manager TLS settings
 
-## License
+## Licensing
 
-This project is licensed under the [Elastic License 2.0](LICENSE). For use cases not covered by ELv2 (OEM, managed services, resale), a commercial license is available from Softside Tech Pty Ltd — contact admin@softsidetech.com.
+bilbycast-appear-x-api-gateway is **dual-licensed**:
+
+- **AGPL-3.0-or-later** for open-source users — free for review, private use, and any use where you are comfortable releasing the source of your modifications (and any modified network service built on top of the gateway) under AGPL terms. See [LICENSE](LICENSE).
+- **Commercial licence** from Softside Tech Pty Ltd for OEMs, hardware integrators, SaaS providers, and commercial customers who need to operate the gateway without AGPL § 13's source-release obligation. Contact **commercial@softsidetech.com** for terms. See [LICENSE.commercial](LICENSE.commercial).
+
+Contributions are accepted under the Developer Certificate of Origin — see [DCO.md](DCO.md) and [CONTRIBUTING.md](CONTRIBUTING.md).

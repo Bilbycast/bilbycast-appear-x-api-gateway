@@ -1,9 +1,9 @@
 [package]
 name = "bilbycast-appear-x-api-gateway"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "API gateway bridging Appear X platform JSON-RPC API to bilbycast-manager WebSocket protocol"
-license = "Elastic-2.0"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1.50.0", features = ["full"] }
