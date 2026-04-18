@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Proprietary
 
 //! TLS configuration for the manager WebSocket connection.
 //! Matches the security model of bilbycast-edge and bilbycast-relay:

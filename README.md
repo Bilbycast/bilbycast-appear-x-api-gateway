@@ -101,9 +101,10 @@ Options:
 
 ## Licensing
 
-bilbycast-appear-x-api-gateway is **dual-licensed**:
+bilbycast-appear-x-api-gateway is **proprietary software**. Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 
-- **AGPL-3.0-or-later** for open-source users — free for review, private use, and any use where you are comfortable releasing the source of your modifications (and any modified network service built on top of the gateway) under AGPL terms. See [LICENSE](LICENSE).
-- **Commercial licence** from Softside Tech Pty Ltd for OEMs, hardware integrators, SaaS providers, and commercial customers who need to operate the gateway without AGPL § 13's source-release obligation. Contact **commercial@softsidetech.com** for terms. See [LICENSE.commercial](LICENSE.commercial).
+Use of this software requires a separate written licence agreement with Softside Tech Pty Ltd. No rights — including use, copying, modification, or redistribution — are granted by the presence of this source code. See [LICENSE](LICENSE) for the full terms.
 
-Contributions are accepted under the Developer Certificate of Origin — see [DCO.md](DCO.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+For licensing inquiries, contact **sales@softsidetech.com**.
+
+This repository does not accept external contributions.

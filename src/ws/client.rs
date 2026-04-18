@@ -1,5 +1,5 @@
-// Copyright (c) 2026 Reza Rahimi. All rights reserved.
-// SPDX-License-Identifier: Elastic-2.0
+// Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+// SPDX-License-Identifier: LicenseRef-Proprietary
 
 //! WebSocket client connecting to bilbycast-manager.
 //! Implements the same auth protocol as bilbycast-edge and bilbycast-relay.
