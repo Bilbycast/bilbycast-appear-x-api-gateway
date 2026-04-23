@@ -1,0 +1,296 @@
+
+--  **************************************************************************
+--  File Appear_Messages.mib
+--
+--  Copyright (c) 2004-2021 by Appear AS
+--
+--  This document (SNMP mib file) is the intellectual property of
+--  Appear AS and contains confidential information.
+--  All reproduction and communication to third parties is strictly prohibited
+--  without prior consent of Appear AS.
+--
+--  **************************************************************************
+
+APPEARTV-X-PLATFORM-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    appeartv
+        FROM APPEARTV-ROOT-MIB
+    NOTIFICATION-GROUP, OBJECT-GROUP
+        FROM SNMPv2-CONF
+    MODULE-IDENTITY, NOTIFICATION-TYPE, OBJECT-IDENTITY, OBJECT-TYPE
+        FROM SNMPv2-SMI
+    ;
+
+appeartvXPlatformMIB MODULE-IDENTITY
+    LAST-UPDATED "202104121334Z" -- April 12, 2021
+    ORGANIZATION "Appear AS"
+    CONTACT-INFO "Appear AS
+                  PO Box 8 Lilleaker
+                  NO-0216 Oslo
+                  Norway
+
+                  mailto:support@appeartv.com
+                  http://www.appeartv.com"
+
+    DESCRIPTION
+        "Root MIB module for Appear X Platform"
+
+    REVISION     "202104121334Z" -- April 12, 2021
+    DESCRIPTION  "Added atvxAlarmConfigObjectSlot to alarm traps"
+
+    REVISION     "201812111100Z" -- December 11, 2018
+    DESCRIPTION  "Added 'event' (6) to atvxAlarmSeverity"
+
+    REVISION     "201810110951Z" -- October 11, 2018
+    DESCRIPTION  "Added atvxAlarmConfigObjectLabel to alarm traps"
+
+    REVISION     "201710191006Z" -- October 19, 2017
+    DESCRIPTION  "Initial version"
+
+    ::= { appeartv 4 }
+
+appeartvXPlatformObjects OBJECT IDENTIFIER ::= { appeartvXPlatformMIB 1 }
+
+appeartvXPlatformNotifications OBJECT IDENTIFIER ::= { appeartvXPlatformMIB 2 }
+
+appeartvXPlatformConformance OBJECT IDENTIFIER ::= { appeartvXPlatformMIB 3 }
+
+
+--  **************************************************************************
+--  appeartvXPlatformObjects subtree
+--  **************************************************************************
+
+atvxAlarms OBJECT IDENTIFIER ::= { appeartvXPlatformObjects 1 }
+
+atvxAlarmTable OBJECT-TYPE
+    SYNTAX        SEQUENCE OF AtvxAlarmEntry
+    MAX-ACCESS    not-accessible
+    STATUS        current
+    DESCRIPTION   "Accessing this table is not implemented."
+    ::= { atvxAlarms 1 }
+
+atvxAlarmEntry OBJECT-TYPE
+    SYNTAX        AtvxAlarmEntry
+    MAX-ACCESS    not-accessible
+    STATUS        current
+    DESCRIPTION   "Entry in alarms table."
+    INDEX
+        { atvxAlarmIndex }
+    ::= { atvxAlarmTable 1 }
+
+AtvxAlarmEntry ::= SEQUENCE
+{
+    atvxAlarmIndex                   INTEGER,
+    atvxAlarmId                      OCTET STRING,
+    atvxAlarmName                    OCTET STRING,
+    atvxAlarmDescription             OCTET STRING,
+    atvxAlarmDetails                 OCTET STRING,
+    atvxAlarmSeverity                INTEGER,
+    atvxAlarmDomain                  OCTET STRING,
+    atvxAlarmTimeSet                 INTEGER,
+    atvxAlarmTimeCleared             INTEGER,
+    atvxAlarmConfigObjectId          OCTET STRING,
+    atvxAlarmConfigObjectType        OCTET STRING,
+    atvxAlarmConfigObjectDescription OCTET STRING,
+    atvxAlarmConfigObjectLabel       OCTET STRING,
+    atvxAlarmConfigObjectSlot        INTEGER
+}
+
+
+atvxAlarmIndex OBJECT-TYPE
+    SYNTAX        INTEGER (0..65535)
+    MAX-ACCESS    accessible-for-notify
+    STATUS        current
+    DESCRIPTION   "Index in alarms table."
+    ::= { atvxAlarmEntry 1 }
+
+atvxAlarmId OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "MACHINE friendly (PROGRAMATIC) representation of TYPE of an alarm"
+    ::= { atvxAlarmEntry 2 }
+
+atvxAlarmName OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "HUMAN friendly description of TYPE of an alarm"
+    ::= { atvxAlarmEntry 3 }
+
+atvxAlarmDescription OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "HUMAN friendly more detailed description of TYPE of alarm"
+    ::= { atvxAlarmEntry 4 }
+
+atvxAlarmDetails OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "HUMAN friendly description of what's wrong and where (e.g. 'PMT Missing: Slot 6,
+                   Input 599, Service 1400' or 'Slot 3, port D1, No bitrate on input 45')"
+    ::= { atvxAlarmEntry 5 }
+
+atvxAlarmSeverity OBJECT-TYPE
+    SYNTAX        INTEGER {
+        filtered(1),
+        notice(2),
+        warning(3),
+        major(4),
+        critical(5),
+        event(6)
+    }
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "MACHINE friendly (PROGRAMATIC) information about alarm severity."
+    ::= { atvxAlarmEntry 6 }
+
+atvxAlarmDomain OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "Area of functionality in system affected by alarm."
+    ::= { atvxAlarmEntry 7 }
+
+atvxAlarmTimeSet OBJECT-TYPE
+    SYNTAX        INTEGER (0..4294967295)
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "UTC time when alarm appeared in a system. In seconds since epoch."
+    ::= { atvxAlarmEntry 8 }
+
+atvxAlarmTimeCleared OBJECT-TYPE
+    SYNTAX        INTEGER (0..4294967295)
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "UTC time when problem dissapeared and alarm was cleared. In secodns since epoch.
+                   If alarm is still active this has value zero."
+    ::= { atvxAlarmEntry 9 }
+
+atvxAlarmConfigObjectId OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "MACHINE friendly (PROGRAMATIC) identifier of configuration object which is 'wrong'
+                   or causing a problem."
+    ::= { atvxAlarmEntry 10 }
+
+atvxAlarmConfigObjectType OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "Name of IDCL type of the configuration entity, it's MACHINE friendly (PROGRAMATIC)
+                   helper allowing some extra reasoning about configuration object."
+    ::= { atvxAlarmEntry 11 }
+
+atvxAlarmConfigObjectDescription OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "HUMAN friendly description of what configuration entity is (overview of what is configured)"
+    ::= { atvxAlarmEntry 12 }
+
+atvxAlarmConfigObjectLabel OBJECT-TYPE
+    SYNTAX        OCTET STRING (SIZE (0..255))
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "Label added by user to a configuration object. Adding a label is possible for some types of configuration objects."
+    ::= { atvxAlarmEntry 13 }
+
+atvxAlarmConfigObjectSlot OBJECT-TYPE
+    SYNTAX        INTEGER (0..65535)
+    MAX-ACCESS    read-only
+    STATUS        current
+    DESCRIPTION   "Tells on which card in a chassis an alarm occurred. Slots begin from 1. Slot zero means there's no information or that alarm doesn't concern a card (e.g. PSU alarms)"
+    ::= { atvxAlarmEntry 14 }
+
+--  **************************************************************************
+--  appeartvXPlatformNotifications subtree
+--  **************************************************************************
+
+-- this node is only to for SNMPv1 compatibility
+-- (second-to-last subidentifier in notification OID should be 0 for SNMPv1 compatibility)
+atvxAlarmNotifications OBJECT IDENTIFIER ::= { appeartvXPlatformNotifications 0 }
+
+atvxAlarmSetTrap NOTIFICATION-TYPE
+    OBJECTS { 
+        atvxAlarmIndex,
+        atvxAlarmId,
+        atvxAlarmName,
+        atvxAlarmDescription,
+        atvxAlarmDetails,
+        atvxAlarmSeverity,
+        atvxAlarmDomain,
+        atvxAlarmTimeSet,
+        -- doesn't have atvxAlarmTimeCleared
+        atvxAlarmConfigObjectId,
+        atvxAlarmConfigObjectType,
+        atvxAlarmConfigObjectDescription,
+        atvxAlarmConfigObjectLabel,
+        atvxAlarmConfigObjectSlot
+    }
+    STATUS        current
+    DESCRIPTION   "This trap is send when an alarm appears (is set) in a system."
+    ::= { atvxAlarmNotifications 1 }
+
+atvxAlarmClearedTrap NOTIFICATION-TYPE
+    OBJECTS { 
+        atvxAlarmIndex,
+        atvxAlarmId,
+        atvxAlarmName,
+        atvxAlarmDescription,
+        atvxAlarmDetails,
+        atvxAlarmSeverity,
+        atvxAlarmDomain,
+        atvxAlarmTimeSet,
+        atvxAlarmTimeCleared,
+        atvxAlarmConfigObjectId,
+        atvxAlarmConfigObjectType,
+        atvxAlarmConfigObjectDescription,
+        atvxAlarmConfigObjectLabel,
+        atvxAlarmConfigObjectSlot
+    }
+    STATUS        current
+    DESCRIPTION   "This trap is send when a problem dissapeares and a corresponding alarm is cleared."
+    ::= { atvxAlarmNotifications 2 }
+
+
+--  **************************************************************************
+--  appeartvXPlatformConformance subtree
+--  **************************************************************************
+
+appeartvXPlatformCompliances OBJECT IDENTIFIER ::= { appeartvXPlatformConformance 1 }
+
+appeartvXPlatformGroups OBJECT IDENTIFIER ::= { appeartvXPlatformConformance 2 }
+
+atvxAlarmGroup OBJECT-GROUP
+    OBJECTS {
+        atvxAlarmIndex,
+        atvxAlarmId,
+        atvxAlarmName,
+        atvxAlarmDescription,
+        atvxAlarmDetails,
+        atvxAlarmSeverity,
+        atvxAlarmDomain,
+        atvxAlarmTimeSet,
+        atvxAlarmTimeCleared,
+        atvxAlarmConfigObjectId,
+        atvxAlarmConfigObjectType,
+        atvxAlarmConfigObjectDescription,
+        atvxAlarmConfigObjectLabel,
+        atvxAlarmConfigObjectSlot
+    }
+    STATUS        current
+    DESCRIPTION   "Objects/variables related to alarms."
+    ::= { appeartvXPlatformGroups 1 }
+
+atvxAlarmTrapsGroup NOTIFICATION-GROUP
+    NOTIFICATIONS { atvxAlarmSetTrap, atvxAlarmClearedTrap }
+    STATUS        current
+    DESCRIPTION   "Traps related to alarms."
+    ::= { appeartvXPlatformGroups 2 }
+
+END
