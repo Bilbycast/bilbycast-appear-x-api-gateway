@@ -26,23 +26,30 @@ pub async fn run_ws_client(
     cmd_tx: mpsc::Sender<CommandMessage>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let mut backoff_secs = 1u64;
-    let max_backoff = 60u64;
+    // Multi-URL failover: rotate among `config.urls` on every WS
+    // close or auth failure, with a fixed 5 s backoff between
+    // attempts. 1-16 URLs, each `wss://`.
+    let fixed_backoff = Duration::from_secs(5);
+    let mut cursor: usize = 0;
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
+        if config.urls.is_empty() {
+            error!("Manager client started with no URLs — config.urls is empty");
+            tokio::select! {
+                _ = tokio::time::sleep(fixed_backoff) => {}
+                _ = cancel.cancelled() => break,
+            }
+            continue;
+        }
+        let current_url = config.urls[cursor % config.urls.len()].clone();
 
-        match try_connect(&config, &mut creds, &mut stats_rx, &cmd_tx, &cancel).await {
-            Ok(ConnectResult::Registered) => {
-                backoff_secs = 1;
-            }
-            Ok(ConnectResult::Closed) => {
-                backoff_secs = 1;
-            }
+        match try_connect(&current_url, &config, &mut creds, &mut stats_rx, &cmd_tx, &cancel).await {
+            Ok(ConnectResult::Registered) | Ok(ConnectResult::Closed) => {}
             Err(e) => {
-                warn!("Manager connection failed: {}", e);
+                warn!("Manager connection to {current_url} failed: {e}");
             }
         }
 
@@ -50,12 +57,15 @@ pub async fn run_ws_client(
             break;
         }
 
-        info!("Reconnecting in {} seconds...", backoff_secs);
+        cursor = cursor.wrapping_add(1);
+        info!(
+            "Reconnecting to next manager URL in {} seconds...",
+            fixed_backoff.as_secs()
+        );
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+            _ = tokio::time::sleep(fixed_backoff) => {}
             _ = cancel.cancelled() => break,
         }
-        backoff_secs = (backoff_secs * 2).min(max_backoff);
     }
 
     Ok(())
@@ -67,13 +77,14 @@ enum ConnectResult {
 }
 
 async fn try_connect(
+    current_url: &str,
     config: &ManagerConfig,
     creds: &mut Credentials,
     stats_rx: &mut mpsc::Receiver<serde_json::Value>,
     cmd_tx: &mpsc::Sender<CommandMessage>,
     cancel: &CancellationToken,
 ) -> Result<ConnectResult> {
-    info!("Connecting to manager at {}", config.url);
+    info!("Connecting to manager at {current_url}");
 
     // Build TLS config
     let tls_config = tls::build_tls_config(
@@ -83,7 +94,7 @@ async fn try_connect(
 
     let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
     let (ws_stream, _) =
-        tokio_tungstenite::connect_async_tls_with_config(&config.url, None, false, Some(connector))
+        tokio_tungstenite::connect_async_tls_with_config(current_url, None, false, Some(connector))
             .await?;
 
     info!("WebSocket connected, authenticating...");

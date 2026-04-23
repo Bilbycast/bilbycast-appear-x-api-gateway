@@ -14,8 +14,12 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagerConfig {
-    /// WebSocket URL for the manager (must be wss://)
-    pub url: String,
+    /// Ordered list of manager WebSocket URLs (each `wss://`, 1–16
+    /// entries). The client tries them in order and rotates on WS
+    /// close with a fixed 5 s backoff. Single-instance deployments
+    /// still use a one-element array — there is no scalar `url`
+    /// field any more.
+    pub urls: Vec<String>,
     /// One-time registration token (cleared after first registration)
     pub registration_token: Option<String>,
     /// Path to file where node_id + node_secret are persisted after registration
@@ -92,10 +96,33 @@ impl AppConfig {
         let config: AppConfig = toml::from_str(&contents)
             .with_context(|| "Failed to parse TOML configuration")?;
 
-        if !skip_manager_validation && !config.manager.url.starts_with("wss://") {
-            anyhow::bail!(
-                "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed."
-            );
+        if !skip_manager_validation {
+            if config.manager.urls.is_empty() {
+                anyhow::bail!("Manager urls[] cannot be empty");
+            }
+            if config.manager.urls.len() > 16 {
+                anyhow::bail!(
+                    "Manager urls[] may contain at most 16 entries (got {})",
+                    config.manager.urls.len()
+                );
+            }
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (i, url) in config.manager.urls.iter().enumerate() {
+                if !url.starts_with("wss://") {
+                    anyhow::bail!(
+                        "Manager urls[{i}] = {url:?} must use wss:// (TLS). \
+                         Plaintext ws:// connections are not allowed."
+                    );
+                }
+                if url.len() > 2048 {
+                    anyhow::bail!(
+                        "Manager urls[{i}] must be at most 2048 characters"
+                    );
+                }
+                if !seen.insert(url.as_str()) {
+                    anyhow::bail!("Manager urls[{i}] = {url:?} is a duplicate");
+                }
+            }
         }
         if config.appear_x.address.is_empty() {
             anyhow::bail!("Appear X address must not be empty");

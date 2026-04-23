@@ -5,7 +5,8 @@
 # which talks only to the Appear X unit and skips the wss:// URL validation.
 
 [manager]
-url = "unused-in-probe-mode"
+# `probe` mode skips URL validation, so this dummy entry is fine.
+urls = ["unused-in-probe-mode"]
 registration_token = ""
 credentials_file = "credentials.json"
 

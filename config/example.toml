@@ -1,8 +1,14 @@
 # bilbycast-appear-x-api-gateway configuration
 
 [manager]
-# WebSocket URL for bilbycast-manager (must be wss://)
-url = "wss://manager.example.com:8443/ws/node"
+# Ordered list of bilbycast-manager WebSocket URLs (each wss://,
+# 1–16 entries). The gateway tries them in order and rotates on
+# WS close with a fixed 5s backoff. For a single-instance manager,
+# use a one-element list — there is no scalar `url` field.
+urls = [
+    "wss://manager-a.example.com:8443/ws/node",
+    # "wss://manager-b.example.com:8443/ws/node",
+]
 
 # One-time registration token (from manager's "Add Node" with device_type=appear_x)
 # After first registration this is no longer needed — credentials are saved to credentials_file
