@@ -103,6 +103,6 @@ bilbycast-appear-x-api-gateway is **proprietary software**. Copyright (c) 2026 S
 
 Use of this software requires a separate written licence agreement with Softside Tech Pty Ltd. No rights — including use, copying, modification, or redistribution — are granted by the presence of this source code. See [LICENSE](LICENSE) for the full terms.
 
-For licensing inquiries, contact **sales@softsidetech.com**.
+For licensing inquiries, contact **contact@bilbycast.com**.
 
 This repository does not accept external contributions.
