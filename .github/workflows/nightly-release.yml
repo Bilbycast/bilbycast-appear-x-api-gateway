@@ -60,8 +60,19 @@ jobs:
             artifact_suffix: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout repository
+      - name: Checkout bilbycast-gateway-sdk (private path dependency)
         uses: actions/checkout@v5
+        with:
+          repository: Bilbycast/bilbycast-gateway-sdk
+          # Fine-grained PAT with Contents: Read on Bilbycast/bilbycast-gateway-sdk.
+          # The default GITHUB_TOKEN cannot cross into other private repos.
+          token: ${{ secrets.GATEWAY_SDK_READ_TOKEN }}
+          path: bilbycast-gateway-sdk
+
+      - name: Checkout bilbycast-appear-x-api-gateway
+        uses: actions/checkout@v5
+        with:
+          path: bilbycast-appear-x-api-gateway
 
       - name: Install musl tools
         run: |
@@ -79,17 +90,18 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ matrix.target }}-cargo-appear-x-${{ hashFiles('Cargo.lock') }}
+            bilbycast-appear-x-api-gateway/target
+          key: ${{ matrix.target }}-cargo-appear-x-${{ hashFiles('bilbycast-appear-x-api-gateway/Cargo.lock') }}
           restore-keys: |
             ${{ matrix.target }}-cargo-appear-x-
 
       - name: Build release binary
+        working-directory: bilbycast-appear-x-api-gateway
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         run: |
-          BINARY="target/${{ matrix.target }}/release/bilbycast-appear-x-api-gateway"
+          BINARY="bilbycast-appear-x-api-gateway/target/${{ matrix.target }}/release/bilbycast-appear-x-api-gateway"
           ARTIFACT="bilbycast-appear-x-api-gateway-${{ matrix.artifact_suffix }}"
           cp "${BINARY}" "${ARTIFACT}"
           chmod +x "${ARTIFACT}"
