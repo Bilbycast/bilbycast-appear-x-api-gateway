@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,7 @@ use super::capabilities::DeviceCapabilities;
 use super::jsonrpc::JsonRpcClient;
 use super::state::SharedAppearXState;
 use crate::config::PollingConfig;
+use crate::ws::event_gate::{EventGate, GateDecision};
 
 /// Interval (seconds) at which the consolidated stats snapshot is pushed to
 /// the manager. Independent of the per-source polling cadences.
@@ -47,6 +49,13 @@ pub async fn run_polling(
     // Authenticate once at startup
     client.authenticate().await?;
 
+    // Client-side event rate gate matching the manager's per-node
+    // 1000/min limit. Stays below the manager cap at 950/min so
+    // self-gating trips first and the operator sees the exact
+    // drop count in a summary event. Shared across every polling
+    // task since they all share the outbound event quota.
+    let event_gate = Arc::new(EventGate::new());
+
     // Spawn alarm polling (MMI endpoint).
     //
     // The alarm poller is special: in addition to writing into the shared
@@ -62,9 +71,11 @@ pub async fn run_polling(
         "alarms",
         {
             let stats_tx = stats_tx.clone();
+            let event_gate = event_gate.clone();
             move |c, st| {
                 let alarms_method = alarms_method.clone();
                 let stats_tx = stats_tx.clone();
+                let event_gate = event_gate.clone();
                 Box::pin(async move {
                     let result = c.call_mmi(&alarms_method, json!({"query": {}})).await?;
                     let alarms_value = result.get("data").cloned().unwrap_or(json!([]));
@@ -127,7 +138,7 @@ pub async fn run_polling(
                             "message": message,
                             "details": details,
                         });
-                        let _ = stats_tx.send(event).await;
+                        emit_gated_event(&stats_tx, &event_gate, event).await;
                     }
 
                     // Emit info events for cleared alarms.
@@ -139,7 +150,7 @@ pub async fn run_polling(
                             "message": format!("Alarm cleared: {alarm_id}"),
                             "details": { "alarm_id": alarm_id },
                         });
-                        let _ = stats_tx.send(event).await;
+                        emit_gated_event(&stats_tx, &event_gate, event).await;
                     }
 
                     // Push a fast `health` notification so the dashboard pill
@@ -342,6 +353,46 @@ pub async fn run_polling(
     // Wait for cancellation
     cancel.cancelled().await;
     Ok(())
+}
+
+/// Route an event through the client-side [`EventGate`] before
+/// handing it to the outbound channel. On suppression, we still
+/// forward the optional summary the gate produced so the operator
+/// sees exactly how many events were dropped in the window.
+async fn emit_gated_event(
+    stats_tx: &mpsc::Sender<serde_json::Value>,
+    gate: &Arc<EventGate>,
+    event: serde_json::Value,
+) {
+    match gate.check() {
+        GateDecision::Send => {
+            let _ = stats_tx.send(event).await;
+        }
+        GateDecision::Suppress { summary } => {
+            // Drop the original — manager's own 1000/min limit
+            // would catch it anyway and drop silently, so
+            // dropping here loses no information.
+            if let Some(s) = summary {
+                // The gate may pack both a rollover summary and
+                // an "also send the original" flag into a
+                // wrapper. Unwrap either shape.
+                if s.get("_rollover_summary").is_some()
+                    && s.get("_accept_and_also_send")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                {
+                    let summary = s
+                        .get("_rollover_summary")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let _ = stats_tx.send(summary).await;
+                    let _ = stats_tx.send(event).await;
+                } else {
+                    let _ = stats_tx.send(s).await;
+                }
+            }
+        }
+    }
 }
 
 fn derive_status(alarms: &[Value]) -> &'static str {

@@ -27,7 +27,8 @@ cargo check
 cargo clippy
 ```
 
-There are no tests in this project currently.
+Tests live alongside the sources (currently: `ws/event_gate.rs`
+covers the client-side rate gate). Run with `cargo test`.
 
 ## Architecture
 
@@ -174,6 +175,42 @@ The driver provides:
 - Health status derivation from alarm severity
 - AI context (Appear X protocol docs, config schema, field rules)
 - AI actions for the generic action rendering system
+
+### Scale-out alignment with manager's Phase 1-5 changes
+
+The gateway speaks `WS_PROTOCOL_VERSION = 1` and the manager has
+not bumped that constant, so every manager-side scale-out change
+is transparent on the wire. For completeness, the manager-side
+deltas that matter for this sidecar:
+
+- **manager_urls[]** (replaces scalar `manager.url`). Config now
+  takes a list of up to 16 `wss://` URLs. The gateway client
+  rotates through them on WS close with a fixed 5 s backoff —
+  see `ws/client.rs`. Probe mode (`cargo run -- probe ...`) skips
+  URL validation.
+- **Per-node event rate limit (1000/min).** The manager drops
+  excess events silently and synthesises one
+  `event_rate_limit_exceeded` per window. The gateway runs its
+  own `ws/event_gate.rs` at 950/min — strictly below the manager
+  cap so client-side self-gating trips first. When it clamps it
+  emits a single `event_rate_limit_selfgate` summary per window
+  so the operator sees the exact suppressed count. No change to
+  steady-state behaviour; the gate only matters during alarm
+  storms.
+- **Cross-instance config_fetch RPC** (Phase 2 tail). Added on
+  the manager side for HA pairs. The gateway does not implement
+  it — when a dashboard on manager A asks for config of a
+  gateway owned by manager B, manager B serves the cached
+  config directly. No gateway change.
+- **Cross-region `region_latency` histogram** (Phase 4/5). The
+  manager samples latency between its own instances, not
+  between gateway and manager. No gateway change needed.
+- **`/api/v1/metrics` endpoint** (Phase 5). Manager-only, gated
+  by bearer token + IP allowlist.
+- **Encrypted backup / HA lifecycle** (`init`, `backup`,
+  `restore`, `promote`, `rejoin`, `upgrade`). Manager-only
+  operator tooling; the gateway reconnects after the manager
+  restarts as usual.
 
 ## Appear X Platform Reference
 
