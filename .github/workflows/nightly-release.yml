@@ -60,13 +60,10 @@ jobs:
             artifact_suffix: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout bilbycast-gateway-sdk (private path dependency)
+      - name: Checkout bilbycast-gateway-sdk (path dependency)
         uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-gateway-sdk
-          # Fine-grained PAT with Contents: Read on Bilbycast/bilbycast-gateway-sdk.
-          # The default GITHUB_TOKEN cannot cross into other private repos.
-          token: ${{ secrets.GATEWAY_SDK_READ_TOKEN }}
           path: bilbycast-gateway-sdk
 
       - name: Checkout bilbycast-appear-x-api-gateway
