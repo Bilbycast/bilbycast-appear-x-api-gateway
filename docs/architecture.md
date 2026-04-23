@@ -15,34 +15,42 @@ The bilbycast-appear-x-api-gateway acts as a protocol bridge between two systems
 └──────────────────┘                            │       │           │         │                           │  Slot N: ...      │
                                                 │       └─────┬─────┘         │                           └──────────────────┘
                                                 │             │               │
-                                                │      ┌──────┴──────┐        │
-                                                │      │  WS Client  │        │
-                                                │      └─────────────┘        │
+                                                │     ┌───────┴────────┐      │
+                                                │     │ bilbycast-     │      │
+                                                │     │ gateway-sdk    │      │
+                                                │     │ (GatewayClient)│      │
+                                                │     └────────────────┘      │
                                                 └──────────────────────────────┘
 ```
+
+The manager-facing WebSocket plumbing — TLS, auth, reconnect, heartbeat,
+envelope serialisation, command dispatch — lives in the shared
+[`bilbycast-gateway-sdk`](../../bilbycast-gateway-sdk/) crate. This gateway
+is purely the vendor translation layer on top of that SDK.
 
 ## Data Flow
 
 ### Read Path (Polling → Manager)
 
 1. Polling engine calls Appear X JSON-RPC methods on configured intervals
-2. Responses are mapped to `stats` or `health` messages
-3. Messages sent through an mpsc channel to the WebSocket client
-4. WS client wraps in `WsEnvelope` and sends to manager
+2. Responses are mapped to `stats` / `health` / `event` payloads
+3. The polling engine calls `Emitter::emit_stats` / `emit_health` / `emit_event` on the SDK
+4. The SDK's write task wraps each payload in the standard envelope and sends it on the WebSocket
 5. Manager's `NodeHub` receives the message, updates cached stats, broadcasts to browser dashboards
 6. The `AppearXDriver` in the manager extracts metrics for display
 
 ### Write Path (Manager → Appear X)
 
 1. User clicks an action button in the AI assistant (or sends a command via API)
-2. Manager sends a `command` message via WebSocket to the gateway
-3. WS client receives the command, creates a oneshot channel for the ack
-4. Command forwarded to the command handler via mpsc channel
-5. Command handler translates the action type to an Appear X JSON-RPC method
-6. JSON-RPC call made to the Appear X unit
-7. Response wrapped in a `command_ack` and sent back through the oneshot channel
-8. WS client sends the ack to the manager
-9. Manager forwards the result to the UI
+2. Manager sends a `command` envelope over WebSocket to the gateway
+3. The SDK read loop dispatches it to `AppearXCommandHandler::handle_command` (or, for `get_config`, to `on_config_request`)
+4. Command handler translates the action type to an Appear X JSON-RPC method
+5. JSON-RPC call made to the Appear X unit
+6. The handler returns `Result<Value, CommandError>`; the SDK serialises that into a `command_ack` (preserving `error_code`) and sends it back to the manager
+7. Manager forwards the result to the UI
+
+`CommandError::code` rides on `command_ack.error_code`. The gateway uses the
+shared taxonomy: `validation_error`, `unknown_action`, `vendor_api_error`.
 
 ### Health Derivation
 
@@ -58,16 +66,17 @@ The gateway derives health status from Appear X alarms:
 
 ### Manager Connection
 
-The gateway implements the exact same security model as bilbycast-edge and bilbycast-relay:
+The gateway implements the exact same security model as bilbycast-edge and bilbycast-relay — all of it inherited from [`bilbycast-gateway-sdk`](../../bilbycast-gateway-sdk/):
 
-1. **TLS enforcement**: Only `wss://` connections accepted
+1. **TLS enforcement**: Only `wss://` connections accepted (`ws://` is rejected at config-validate time)
 2. **Three TLS modes**:
    - **Standard**: Validates against system CA roots (webpki-roots)
    - **Self-signed**: Bypasses all cert validation (requires `BILBYCAST_ALLOW_INSECURE=1`)
    - **Pinned**: SHA-256 fingerprint verification of the server certificate
 3. **Auth as first frame**: Credentials sent in the first WebSocket message, not in URL/headers
-4. **Credential persistence**: After registration, node_id + node_secret saved to a file with 0600 permissions
-5. **Exponential backoff**: 1s → 60s on connection failures, reset on success
+4. **Credential persistence**: After registration, node_id + node_secret saved to a file with 0600 permissions via the SDK's `CredentialStore`
+5. **Reconnect backoff**: SDK-driven exponential backoff (1s → 2s → 5s → 10s → 30s, saturating), reset on successful auth
+6. **Multi-URL failover**: the SDK rotates through `manager.urls[]` on every WS close
 
 ### Appear X Connection
 
@@ -77,21 +86,20 @@ The gateway implements the exact same security model as bilbycast-edge and bilby
 
 ## Concurrency Model
 
-All three main tasks run concurrently via `tokio::spawn`:
+Two top-level tasks run concurrently via `tokio::spawn`:
 
 ```
 main()
   ├── spawn: polling engine (multiple sub-tasks per board/poll type)
-  ├── spawn: command handler (receives from mpsc channel)
-  └── await: WS client (blocks until cancellation)
+  └── await: GatewayClient::run (SDK — connect/auth/reconnect/read/write/heartbeat)
 ```
 
-Communication between tasks uses tokio channels:
-- `mpsc::channel<Value>(64)` — polling → WS client (stats/health messages)
-- `mpsc::channel<CommandMessage>(32)` — WS client → command handler (incoming commands)
-- `oneshot::channel` per command — command handler → WS client (ack response)
+The SDK exposes:
+- `Emitter` (cloneable) — the polling engine's outbound channel for stats / health / events / thumbnails / config_responses. Backed by `mpsc::channel<OutboundFrame>(256)` internally.
+- `CommandHandler` trait — the SDK read loop dispatches every `command` envelope directly here; there is no longer a local mpsc+oneshot hop.
+- `CancellationToken` — obtained via `client.shutdown_token()`, wired to ctrl-c in `main`.
 
-Graceful shutdown uses `tokio_util::CancellationToken` tree — cancelling the root token propagates to all child tokens.
+Graceful shutdown uses `tokio_util::CancellationToken` — cancelling the token stops the SDK read/write/heartbeat tasks and signals the polling engine (which holds its own clone) to exit.
 
 ## Appear X API Details
 

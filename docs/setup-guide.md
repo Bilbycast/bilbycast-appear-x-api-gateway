@@ -26,7 +26,7 @@
 
 ```toml
 [manager]
-url = "wss://your-manager-host:8443/ws/node"
+urls = ["wss://your-manager-host:8443/ws/node"]
 registration_token = "paste-your-token-here"
 credentials_file = "credentials.json"
 
@@ -48,15 +48,12 @@ alarms_interval_secs = 10
 chassis_interval_secs = 30
 inputs_interval_secs = 15
 outputs_interval_secs = 15
-services_interval_secs = 30
-
-[[polling.boards]]
-slot = 1
-interface = "ipGateway"
-api_version = "1.15"
+cards_interval_secs = 30
 ```
 
-3. Add additional `[[polling.boards]]` entries for each board slot you want to monitor
+3. No per-board entries are needed — the gateway runs a startup
+capability-discovery pass and spawns per-slot pollers automatically
+based on what each card's firmware actually exposes.
 
 ## Step 3: Run the Gateway
 

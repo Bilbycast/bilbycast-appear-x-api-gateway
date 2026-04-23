@@ -4,7 +4,7 @@
 //! Polling engine that periodically fetches data from the Appear X unit
 //! and writes it into [`SharedAppearXState`]. A single emitter task
 //! periodically snapshots that state and sends one consolidated `stats`
-//! message to the manager via the WS client.
+//! message to the manager via the SDK's [`Emitter`].
 //!
 //! This avoids the "last payload wins" problem on the manager side, where
 //! every separate `stats` message would overwrite the previous one in
@@ -13,10 +13,10 @@
 //! payload.
 
 use anyhow::Result;
+use bilbycast_gateway_sdk::{Emitter, EventSeverity, GatewayEvent};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +24,7 @@ use super::capabilities::DeviceCapabilities;
 use super::jsonrpc::JsonRpcClient;
 use super::state::SharedAppearXState;
 use crate::config::PollingConfig;
-use crate::ws::event_gate::{EventGate, GateDecision};
+use crate::event_gate::{EventGate, GateDecision};
 
 /// Interval (seconds) at which the consolidated stats snapshot is pushed to
 /// the manager. Independent of the per-source polling cadences.
@@ -43,7 +43,7 @@ pub async fn run_polling(
     config: PollingConfig,
     caps: DeviceCapabilities,
     state: SharedAppearXState,
-    stats_tx: mpsc::Sender<serde_json::Value>,
+    emitter: Emitter,
     cancel: CancellationToken,
 ) -> Result<()> {
     // Authenticate once at startup
@@ -54,6 +54,9 @@ pub async fn run_polling(
     // self-gating trips first and the operator sees the exact
     // drop count in a summary event. Shared across every polling
     // task since they all share the outbound event quota.
+    //
+    // The SDK does not expose a rate-limiter helper as of v0.1, so
+    // this lives locally. See `event_gate.rs` for the full rationale.
     let event_gate = Arc::new(EventGate::new());
 
     // Spawn alarm polling (MMI endpoint).
@@ -70,11 +73,11 @@ pub async fn run_polling(
         config.alarms_interval_secs,
         "alarms",
         {
-            let stats_tx = stats_tx.clone();
+            let emitter = emitter.clone();
             let event_gate = event_gate.clone();
             move |c, st| {
                 let alarms_method = alarms_method.clone();
-                let stats_tx = stats_tx.clone();
+                let emitter = emitter.clone();
                 let event_gate = event_gate.clone();
                 Box::pin(async move {
                     let result = c.call_mmi(&alarms_method, json!({"query": {}})).await?;
@@ -112,9 +115,9 @@ pub async fn run_polling(
                             .and_then(|s| s.as_str())
                             .unwrap_or("");
                         let event_severity = match severity {
-                            "CRITICAL" | "MAJOR" => "critical",
-                            "MINOR" | "WARNING" => "warning",
-                            _ => "info",
+                            "CRITICAL" | "MAJOR" => EventSeverity::Critical,
+                            "MINOR" | "WARNING" => EventSeverity::Minor,
+                            _ => EventSeverity::Info,
                         };
                         let message = if alarm_name.is_empty() {
                             format!("Alarm raised: {description}")
@@ -131,37 +134,29 @@ pub async fn run_polling(
                         if !object_label.is_empty() {
                             details["object"] = json!(object_label);
                         }
-                        let event = json!({
-                            "_msg_type": "event",
-                            "severity": event_severity,
-                            "category": "alarm",
-                            "message": message,
-                            "details": details,
-                        });
-                        emit_gated_event(&stats_tx, &event_gate, event).await;
+                        let event = GatewayEvent::new(event_severity, "alarm", message)
+                            .with_details(details);
+                        emit_gated_event(&emitter, &event_gate, event).await;
                     }
 
                     // Emit info events for cleared alarms.
                     for alarm_id in &cleared_ids {
-                        let event = json!({
-                            "_msg_type": "event",
-                            "severity": "info",
-                            "category": "alarm",
-                            "message": format!("Alarm cleared: {alarm_id}"),
-                            "details": { "alarm_id": alarm_id },
-                        });
-                        emit_gated_event(&stats_tx, &event_gate, event).await;
+                        let event = GatewayEvent::info(
+                            "alarm",
+                            format!("Alarm cleared: {alarm_id}"),
+                        )
+                        .with_details(json!({ "alarm_id": alarm_id }));
+                        emit_gated_event(&emitter, &event_gate, event).await;
                     }
 
                     // Push a fast `health` notification so the dashboard pill
                     // updates between stats emit ticks.
                     let health = json!({
-                        "_msg_type": "health",
                         "status": status,
                         "alarms": alarms_value,
                         "version": env!("CARGO_PKG_VERSION"),
                     });
-                    let _ = stats_tx.send(health).await;
+                    let _ = emitter.emit_health(health).await;
                     Ok(())
                 })
             }
@@ -328,7 +323,7 @@ pub async fn run_polling(
     // Single consolidated stats emitter — snapshots SharedAppearXState every
     // STATS_EMIT_INTERVAL_SECS and ships ONE merged payload to the manager.
     {
-        let stats_tx = stats_tx.clone();
+        let emitter = emitter.clone();
         let state = state.clone();
         let emit_cancel = cancel.child_token();
         tokio::spawn(async move {
@@ -340,7 +335,7 @@ pub async fn run_polling(
                     _ = emit_cancel.cancelled() => break,
                     _ = interval.tick() => {
                         let snapshot = state.snapshot().await;
-                        if stats_tx.send(snapshot).await.is_err() {
+                        if emitter.emit_stats(snapshot).await.is_err() {
                             debug!("stats_emitter: channel closed, exiting");
                             break;
                         }
@@ -356,40 +351,27 @@ pub async fn run_polling(
 }
 
 /// Route an event through the client-side [`EventGate`] before
-/// handing it to the outbound channel. On suppression, we still
-/// forward the optional summary the gate produced so the operator
-/// sees exactly how many events were dropped in the window.
-async fn emit_gated_event(
-    stats_tx: &mpsc::Sender<serde_json::Value>,
-    gate: &Arc<EventGate>,
-    event: serde_json::Value,
-) {
+/// handing it to the SDK emitter. On suppression, we still forward
+/// the optional summary the gate produced so the operator sees
+/// exactly how many events were dropped in the window.
+async fn emit_gated_event(emitter: &Emitter, gate: &Arc<EventGate>, event: GatewayEvent) {
     match gate.check() {
         GateDecision::Send => {
-            let _ = stats_tx.send(event).await;
+            let _ = emitter.emit_event(event).await;
+        }
+        GateDecision::SendWithRollover { summary } => {
+            // Rollover summary for the prior window first, then the
+            // current event — ordering preserves what the operator
+            // sees in the event log.
+            let _ = emitter.emit_event(summary).await;
+            let _ = emitter.emit_event(event).await;
         }
         GateDecision::Suppress { summary } => {
             // Drop the original — manager's own 1000/min limit
             // would catch it anyway and drop silently, so
             // dropping here loses no information.
             if let Some(s) = summary {
-                // The gate may pack both a rollover summary and
-                // an "also send the original" flag into a
-                // wrapper. Unwrap either shape.
-                if s.get("_rollover_summary").is_some()
-                    && s.get("_accept_and_also_send")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                {
-                    let summary = s
-                        .get("_rollover_summary")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    let _ = stats_tx.send(summary).await;
-                    let _ = stats_tx.send(event).await;
-                } else {
-                    let _ = stats_tx.send(s).await;
-                }
+                let _ = emitter.emit_event(s).await;
             }
         }
     }

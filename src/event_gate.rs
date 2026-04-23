@@ -22,11 +22,17 @@
 //! same 60 s window — client-side self-suppression always wins,
 //! which means the operator sees the exact count of dropped
 //! events instead of a silent manager-side clamp.
+//!
+//! The SDK does not (yet) expose a rate-limit helper, so the
+//! Phase 6 migration keeps this gate in the gateway. A future
+//! SDK release is expected to promote it once a second vendor
+//! gateway exists.
 
 use std::sync::Mutex;
 
+use bilbycast_gateway_sdk::{EventSeverity, GatewayEvent};
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// Hard cap (events / minute) that stays strictly below the
 /// manager's 1000/min limit so self-gating always trips first.
@@ -46,18 +52,26 @@ struct WindowState {
 }
 
 /// What the caller should do with the event being proposed.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum GateDecision {
     /// Send the event as-is.
     Send,
     /// Suppress the event. Caller can still emit the optional
     /// summary when provided.
     Suppress {
-        /// Summary envelope to emit in place of the dropped
-        /// event, so the operator sees that suppression is
-        /// happening. `None` if the gate hasn't yet crossed its
-        /// cap in this window.
-        summary: Option<Value>,
+        /// Summary event to emit in place of the dropped event so
+        /// the operator sees that suppression is happening.
+        /// `None` if the gate hasn't yet crossed its cap in this
+        /// window.
+        summary: Option<GatewayEvent>,
+    },
+    /// A prior window rolled over and had suppressed events —
+    /// emit this rollover summary AND then send the proposed
+    /// event. Covers the narrow race where window N ends on a
+    /// suppressed tail and window N+1 opens with an accepted
+    /// event.
+    SendWithRollover {
+        summary: GatewayEvent,
     },
 }
 
@@ -81,7 +95,7 @@ impl EventGate {
         // Window roll: if we crossed a 60 s boundary since the
         // last check, emit a summary for the PRIOR window's
         // suppressed count before resetting.
-        let mut summary_on_roll: Option<Value> = None;
+        let mut summary_on_roll: Option<GatewayEvent> = None;
         if now.signed_duration_since(st.window_start) >= Duration::seconds(WINDOW_SECS) {
             if st.suppressed > 0 {
                 summary_on_roll = Some(selfgate_summary(st.suppressed, st.accepted));
@@ -93,15 +107,8 @@ impl EventGate {
 
         if st.accepted < SELF_GATE_LIMIT_PER_MINUTE {
             st.accepted = st.accepted.saturating_add(1);
-            // Window-roll summary still surfaces even when the
-            // new event is accepted — the caller sends two.
             if let Some(summary) = summary_on_roll {
-                return GateDecision::Suppress {
-                    summary: Some(json!({
-                        "_rollover_summary": summary,
-                        "_accept_and_also_send": true,
-                    })),
-                };
+                return GateDecision::SendWithRollover { summary };
             }
             return GateDecision::Send;
         }
@@ -124,26 +131,25 @@ impl Default for EventGate {
     }
 }
 
-/// Build the `event_rate_limit_selfgate` envelope. Matches the
-/// `_msg_type=event` shape the polling engine already produces,
-/// so the WS client serialises it identically.
-fn selfgate_summary(suppressed: u32, accepted: u32) -> Value {
-    json!({
-        "_msg_type": "event",
-        "severity": "warning",
-        "category": "event_rate_limit_selfgate",
-        "message": format!(
+/// Build the `event_rate_limit_selfgate` summary event. Severity
+/// is `minor` — the SDK's `EventSeverity` enum uses the edge/relay
+/// taxonomy (info / minor / major / critical).
+fn selfgate_summary(suppressed: u32, accepted: u32) -> GatewayEvent {
+    GatewayEvent::new(
+        EventSeverity::Minor,
+        "event_rate_limit_selfgate",
+        format!(
             "Gateway self-rate-limiter engaged: {suppressed} event(s) suppressed \
              (accepted {accepted} in the current 60s window). \
-             Raise the polling cadence only if the manager can absorb more.",
+             Raise the polling cadence only if the manager can absorb more."
         ),
-        "details": {
-            "suppressed": suppressed,
-            "accepted": accepted,
-            "limit_per_minute": SELF_GATE_LIMIT_PER_MINUTE,
-            "manager_limit_per_minute": 1000,
-        },
-    })
+    )
+    .with_details(json!({
+        "suppressed": suppressed,
+        "accepted": accepted,
+        "limit_per_minute": SELF_GATE_LIMIT_PER_MINUTE,
+        "manager_limit_per_minute": 1000,
+    }))
 }
 
 #[cfg(test)]
@@ -153,14 +159,14 @@ mod tests {
     #[test]
     fn first_event_passes_without_summary() {
         let gate = EventGate::new();
-        assert_eq!(gate.check(), GateDecision::Send);
+        assert!(matches!(gate.check(), GateDecision::Send));
     }
 
     #[test]
     fn over_cap_suppresses_with_single_summary() {
         let gate = EventGate::new();
         for _ in 0..SELF_GATE_LIMIT_PER_MINUTE {
-            assert_eq!(gate.check(), GateDecision::Send);
+            assert!(matches!(gate.check(), GateDecision::Send));
         }
         // First over-cap event yields a summary.
         match gate.check() {

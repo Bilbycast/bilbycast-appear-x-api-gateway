@@ -12,13 +12,18 @@ pub struct AppConfig {
     pub polling: PollingConfig,
 }
 
+/// Operator-facing `[manager]` section of the gateway's TOML config.
+///
+/// This shape is intentionally a superset of the SDK's `GatewayConfig`: the
+/// SDK owns validation of the WS-facing fields (URLs, certs, credentials),
+/// and `credentials_file` is the gateway's own disk-path for the
+/// `CredentialStore`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagerConfig {
     /// Ordered list of manager WebSocket URLs (each `wss://`, 1–16
-    /// entries). The client tries them in order and rotates on WS
-    /// close with a fixed 5 s backoff. Single-instance deployments
-    /// still use a one-element array — there is no scalar `url`
-    /// field any more.
+    /// entries). The SDK rotates through them on WS close with the
+    /// standard reconnect backoff. Single-instance deployments still
+    /// use a one-element array.
     pub urls: Vec<String>,
     /// One-time registration token (cleared after first registration)
     pub registration_token: Option<String>,
@@ -90,6 +95,10 @@ impl AppConfig {
     /// Load the config, optionally skipping the manager URL validation.
     /// `skip_manager_validation = true` is used by the `probe` subcommand,
     /// which talks only to the Appear X unit and never connects to the manager.
+    ///
+    /// Note: the SDK's `GatewayConfig::validate()` re-runs the WS-facing
+    /// checks at connect time; the validation here is a friendlier
+    /// early failure for misconfigured deployments.
     pub fn load_for_command(path: &Path, skip_manager_validation: bool) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;

@@ -2,6 +2,14 @@
 
 This guide explains how to create a new API gateway for a 3rd-party broadcast device, using `bilbycast-appear-x-api-gateway` as the reference implementation.
 
+Since Phase 6 of the plugin refactor, every manager-facing byte of the
+WebSocket protocol lives in the shared [`bilbycast-gateway-sdk`](../../bilbycast-gateway-sdk/)
+crate. **New gateways should consume the SDK — do NOT re-implement the
+WebSocket client.** The SDK's own guide at
+`bilbycast-gateway-sdk/docs/writing-a-gateway.md` is the authoritative
+reference; this document focuses on the Appear X-specific patterns that
+are worth copying.
+
 ## When to Use This Pattern
 
 Use the API gateway pattern when integrating a device that:
@@ -14,51 +22,48 @@ Use the API gateway pattern when integrating a device that:
 
 Each 3rd-party device requires:
 
-1. **API gateway binary** — a standalone Rust project that bridges the device's native API to the manager's WebSocket protocol
+1. **API gateway binary** — a standalone Rust project that consumes
+   `bilbycast-gateway-sdk` and implements `CommandHandler` + a polling loop
 2. **Manager driver** — a `DeviceDriver` implementation in `bilbycast-manager` that defines metrics extraction, commands, and AI actions
 
 ## Step 1: Create the Gateway Project
 
 ### Project Structure
 
-Copy the structure of `bilbycast-appear-x-api-gateway`:
+The canonical shape after Phase 6:
 
 ```
 bilbycast-<device>-api-gateway/
-├── Cargo.toml
+├── Cargo.toml              # depends on bilbycast-gateway-sdk
 ├── CLAUDE.md
 ├── src/
-│   ├── main.rs              # CLI, config, tokio runtime
-│   ├── config.rs            # TOML config parsing
-│   ├── credentials.rs       # Node credential persistence (reuse as-is)
-│   ├── ws/
-│   │   ├── mod.rs
-│   │   ├── client.rs        # WebSocket client (reuse as-is)
-│   │   ├── tls.rs           # TLS config (reuse as-is)
-│   │   └── message.rs       # WsEnvelope builders (reuse as-is)
+│   ├── main.rs             # CLI, config, GatewayClient wiring, task spawning
+│   ├── config.rs           # TOML config parsing
 │   └── <device>/
 │       ├── mod.rs
-│       ├── api_client.rs    # Device-specific API client
-│       ├── polling.rs       # Polling engine (device-specific endpoints)
-│       └── commands.rs      # Command handler (device-specific translation)
+│       ├── api_client.rs   # Device-specific API client
+│       ├── polling.rs      # Polling engine (device-specific endpoints)
+│       └── commands.rs     # impl CommandHandler
 ├── config/
 │   └── example.toml
 └── docs/
 ```
 
-### Reusable Modules
+No `ws/`, no `credentials.rs` — the SDK owns both.
 
-The `ws/` directory can be copied directly — it implements the bilbycast WebSocket protocol and is device-agnostic:
-- `ws/client.rs` — manager connection, auth, reconnect, message loop
-- `ws/tls.rs` — three TLS modes matching edge/relay security
-- `ws/message.rs` — WsEnvelope builders for stats, health, command_ack
-- `credentials.rs` — node_id + node_secret persistence
+### SDK-Provided Building Blocks
 
-When a second gateway exists, these should be extracted into a shared crate.
+From `bilbycast-gateway-sdk`:
+
+- `GatewayClient::connect(cfg, handler)` → `connect/reconnect/auth/heartbeat` loop
+- `GatewayConfig` → operator-facing `[manager]` section shape (`manager_urls[]`, `registration_token`, credentials, TLS)
+- `CredentialStore` → 0600 JSON persistence for `(node_id, node_secret)`
+- `Emitter` → `emit_stats` / `emit_health` / `emit_event` / `emit_thumbnail` / `emit_config_response`
+- `CommandHandler` trait → `handle_command(command_id, action)` + `on_config_request()`
+- `CommandError::new("...", "...")` / `CommandError::unknown_action(...)` / `CommandError::validation(...)` — map onto `command_ack.error_code`
+- `GatewayEvent::{info,minor,major,critical}(category, message).with_details(..).with_error_code(..)`
 
 ### Device-Specific Modules
-
-Replace the `appear_x/` directory with your device's API integration:
 
 **API Client** (`<device>/api_client.rs`):
 - Handle device authentication (API keys, OAuth, session tokens, etc.)
@@ -67,13 +72,14 @@ Replace the `appear_x/` directory with your device's API integration:
 
 **Polling Engine** (`<device>/polling.rs`):
 - Define what data to poll (status, config, alarms, metrics)
-- Map device responses to `stats` and `health` messages
+- Call `emitter.emit_stats(...)` / `emit_health(...)` / `emit_event(...)` on each poll
 - Health derivation: map device health indicators to `ok`/`degraded`/`critical`
 
 **Command Handler** (`<device>/commands.rs`):
-- Map manager command types to device API calls
-- Handle read commands (get current state) and write commands (apply config)
-- Return success/error ack with optional response data
+- Implement `bilbycast_gateway_sdk::CommandHandler`
+- Map `action["type"]` to device API calls
+- Return `Result<Value, CommandError>` — the SDK packs this into `command_ack`
+- Implement `on_config_request` to return the consolidated state snapshot
 
 ### Config Format
 
@@ -81,9 +87,11 @@ Define device-specific config sections in `config.rs`:
 
 ```toml
 [manager]
-# Same for all gateways — manager URL, auth, TLS settings
-url = "wss://manager:8443/ws/node"
+# Shared across all gateways.
+urls = ["wss://manager:8443/ws/node"]
 registration_token = "..."
+credentials_file = "credentials.json"
+accept_self_signed_cert = false
 
 [<device>]
 # Device-specific connection settings

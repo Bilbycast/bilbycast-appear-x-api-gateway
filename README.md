@@ -22,8 +22,9 @@ Edit `config.toml`:
 
 ```toml
 [manager]
-url = "wss://your-manager-host:8443/ws/node"
+urls = ["wss://your-manager-host:8443/ws/node"]
 registration_token = "<token-from-manager>"
+credentials_file = "credentials.json"
 
 [appear_x]
 address = "192.168.1.100"
@@ -36,15 +37,12 @@ alarms_interval_secs = 10
 chassis_interval_secs = 30
 inputs_interval_secs = 15
 outputs_interval_secs = 15
-services_interval_secs = 30
-
-[[polling.boards]]
-slot = 1
-interface = "ipGateway"
-api_version = "1.15"
+cards_interval_secs = 30
 ```
 
-Add additional `[[polling.boards]]` entries for each board slot to monitor.
+Per-board polling is derived automatically via the runtime capability
+discovery pass — there is no `[[polling.boards]]` section. See
+`config/example.toml` for the fully annotated template.
 
 ### 3. Build and run
 

@@ -6,17 +6,23 @@
 //! This gateway connects to bilbycast-manager as a WebSocket client (same protocol
 //! as edge/relay nodes) and polls an Appear X unit via its JSON-RPC 2.0 API,
 //! translating stats/health/commands between the two systems.
+//!
+//! The manager-facing WS plumbing (auth, reconnect, heartbeat, TLS, envelope
+//! serialisation) lives in [`bilbycast_gateway_sdk`]; this crate is the
+//! Appear X vendor translation layer on top of it.
 
 mod appear_x;
 mod config;
-mod credentials;
-mod ws;
+mod event_gate;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bilbycast_gateway_sdk::{
+    CredentialStore, GatewayClient, GatewayConfig, PersistedCredentials,
+};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
-use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -54,24 +60,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     info!("Loading configuration from {:?}", cli.config);
-    let cfg = config::AppConfig::load_for_command(&cli.config, matches!(cli.command, Some(Command::Probe)))?;
+    let cfg = config::AppConfig::load_for_command(
+        &cli.config,
+        matches!(cli.command, Some(Command::Probe)),
+    )?;
 
     if matches!(cli.command, Some(Command::Probe)) {
         return run_probe(&cfg).await;
     }
-
-    let cancel = CancellationToken::new();
-
-    // Set up ctrl-c handler
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Received shutdown signal");
-        cancel_clone.cancel();
-    });
-
-    // Load or prepare credentials
-    let creds = credentials::Credentials::load_or_default(&cfg.manager)?;
 
     // Build the Appear X JSON-RPC client
     let appear_client = appear_x::jsonrpc::JsonRpcClient::new(&cfg.appear_x)?;
@@ -92,10 +88,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Create channels for communication between polling and WS client
-    let (stats_tx, stats_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ws::message::CommandMessage>(32);
-
     // Shared state owned by both the polling engine (writers) and the
     // command handler (reader, for `get_config` responses).
     let shared_state = appear_x::state::SharedAppearXState::new(
@@ -104,53 +96,88 @@ async fn main() -> Result<()> {
         cfg.appear_x.address.clone(),
     );
 
-    // Spawn the polling engine
-    let polling_cancel = cancel.child_token();
+    // Build the SDK gateway client, seeded from persisted credentials when
+    // available. `CredentialStore` handles the 0600 JSON blob for us.
+    let credentials_file = cfg.manager.credentials_file.clone();
+    let store = CredentialStore::new(credentials_file.clone());
+    let persisted = store.load().with_context(|| {
+        format!("Failed to load credentials from {credentials_file}")
+    })?;
+
+    let mut gateway_cfg = GatewayConfig {
+        manager_urls: cfg.manager.urls.clone(),
+        device_type: "appear_x".into(),
+        software_version: env!("CARGO_PKG_VERSION").into(),
+        node_id: persisted.node_id.clone(),
+        node_secret: persisted.node_secret.clone(),
+        registration_token: None,
+        accept_self_signed_cert: cfg.manager.accept_self_signed_cert,
+        cert_fingerprint: cfg.manager.cert_fingerprint.clone(),
+        heartbeat_interval: std::time::Duration::from_secs(15),
+        reconnect_backoff: Default::default(),
+    };
+    if !persisted.has_credentials() {
+        gateway_cfg.registration_token = cfg.manager.registration_token.clone();
+    }
+
+    let handler = Arc::new(appear_x::commands::AppearXCommandHandler::new(
+        appear_client.clone(),
+        shared_state.clone(),
+    ));
+
+    let mut client = GatewayClient::connect(gateway_cfg, handler).await?;
+    let shutdown = client.shutdown_token();
+
+    // Persist credentials after first-time registration.
+    let store_cb = store.clone();
+    client.on_register(move |node_id, node_secret| {
+        let creds = PersistedCredentials {
+            node_id: Some(node_id.to_string()),
+            node_secret: Some(node_secret.to_string()),
+            registration_token: None,
+        };
+        if let Err(e) = store_cb.save(&creds) {
+            error!("Failed to persist credentials: {e}");
+        } else {
+            info!("Credentials persisted after registration");
+        }
+    });
+
+    // Wire ctrl-c → SDK shutdown token so the connect loop exits cleanly.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Received shutdown signal");
+            shutdown.cancel();
+        });
+    }
+
+    // Spawn the polling engine. It emits stats/health/events directly
+    // through the SDK's Emitter (which feeds the WS write task).
+    let polling_emitter = client.emitter();
+    let polling_cancel = shutdown.clone();
     let polling_client = appear_client.clone();
     let polling_cfg = cfg.polling.clone();
     let polling_caps = caps.clone();
     let polling_state = shared_state.clone();
-    let polling_stats_tx = stats_tx.clone();
     tokio::spawn(async move {
         if let Err(e) = appear_x::polling::run_polling(
             polling_client,
             polling_cfg,
             polling_caps,
             polling_state,
-            polling_stats_tx,
+            polling_emitter,
             polling_cancel,
         )
         .await
         {
-            error!("Polling engine error: {}", e);
+            error!("Polling engine error: {e}");
         }
     });
 
-    // Spawn the command handler. It also gets a stats_tx clone so it can
-    // emit `config_response` envelopes when the manager issues `get_config`.
-    let cmd_cancel = cancel.child_token();
-    let cmd_client = appear_client.clone();
-    let cmd_state = shared_state.clone();
-    let cmd_stats_tx = stats_tx.clone();
-    tokio::spawn(async move {
-        appear_x::commands::run_command_handler(
-            cmd_client,
-            cmd_state,
-            cmd_stats_tx,
-            cmd_rx,
-            cmd_cancel,
-        )
-        .await;
-    });
-
-    // Drop the original stats_tx — both polling and the command handler now
-    // hold their own clones, so the channel will stay open until both tasks
-    // finish. Without this, an extra reference would prevent stats_rx from
-    // ever observing channel closure on shutdown.
-    drop(stats_tx);
-
-    // Run the WebSocket client (blocks until cancelled)
-    ws::client::run_ws_client(cfg.manager.clone(), creds, stats_rx, cmd_tx, cancel).await?;
+    // Run the WS client (blocks until the shutdown token fires).
+    client.run().await?;
 
     info!("Gateway shut down cleanly");
     Ok(())

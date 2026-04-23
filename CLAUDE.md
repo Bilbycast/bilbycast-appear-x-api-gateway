@@ -27,7 +27,7 @@ cargo check
 cargo clippy
 ```
 
-Tests live alongside the sources (currently: `ws/event_gate.rs`
+Tests live alongside the sources (currently: `event_gate.rs`
 covers the client-side rate gate). Run with `cargo test`.
 
 ## Architecture
@@ -43,47 +43,45 @@ bilbycast-manager (WebSocket) ←──── bilbycast-appear-x-api-gateway ─
                               (reads stats)    (writes config)
 ```
 
-The gateway runs three concurrent tasks:
-1. **WebSocket client** — connects to manager, handles auth, sends stats/health, receives commands
-2. **Polling engine** — periodically calls Appear X JSON-RPC methods, maps responses to manager stats/health messages
-3. **Command handler** — receives commands from manager via the WS client, translates them to Appear X JSON-RPC calls, returns ack
+The gateway runs two top-level tasks:
+1. **SDK WebSocket client** ([`bilbycast-gateway-sdk`](../bilbycast-gateway-sdk/)) — owns the manager connection, auth, reconnect, heartbeat, envelope serialisation, and command dispatch
+2. **Polling engine** — periodically calls Appear X JSON-RPC methods, pushes stats/health/events through the SDK's `Emitter`. The `CommandHandler` implementation (`AppearXCommandHandler`) is called directly by the SDK read loop.
 
 ### Source Layout
 
 ```
 src/
-├── main.rs              # CLI (clap), config loading, tokio runtime, task spawning
+├── main.rs              # CLI (clap), config loading, SDK wiring, task spawning
 ├── config.rs            # TOML config parsing + validation
-├── credentials.rs       # Node credential persistence (node_id + node_secret)
-├── ws/
-│   ├── mod.rs
-│   ├── client.rs        # WebSocket client (auth, reconnect, message loop)
-│   ├── tls.rs           # TLS config: standard CA, self-signed, cert pinning
-│   └── message.rs       # WsEnvelope builders (stats, health, event, command_ack)
+├── event_gate.rs        # 950/min client-side event rate-limiter
 └── appear_x/
     ├── mod.rs
     ├── jsonrpc.rs        # JSON-RPC 2.0 client (session mgmt, request builder)
     ├── polling.rs        # Polling engine (alarms, chassis, inputs, outputs, services)
-    └── commands.rs       # Command handler (manager commands → JSON-RPC calls)
+    ├── commands.rs       # AppearXCommandHandler (impl of SDK CommandHandler)
+    ├── capabilities.rs   # Startup capability discovery
+    ├── probe_registry.rs # Registry of per-card-family probe candidates
+    └── state.rs          # SharedAppearXState — consolidated polling snapshot
 ```
 
-### WebSocket Client (`ws/client.rs`)
+### Manager-facing WS plumbing (`bilbycast-gateway-sdk`)
 
-Implements the same auth protocol as bilbycast-edge and bilbycast-relay:
+The gateway delegates every manager-facing byte to the shared SDK crate. The SDK owns:
 
 - **wss:// enforcement** — rejects plaintext ws:// connections
-- **Three TLS modes** (`ws/tls.rs`):
+- **Three TLS modes**:
   - Standard: system CA roots via webpki-roots
   - Self-signed: requires `BILBYCAST_ALLOW_INSECURE=1` env var, logs security warning
-  - Certificate pinning: SHA-256 fingerprint verification via `PinnedCertVerifier`
+  - Certificate pinning: SHA-256 fingerprint verification
 - **Auth as first frame** (not in URL):
-  - Registration: `{"type": "auth", "payload": {"registration_token": "...", "software_version": "...", "protocol_version": 1}}`
-  - Reconnection: `{"type": "auth", "payload": {"node_id": "...", "node_secret": "...", "software_version": "...", "protocol_version": 1}}`
+  - Registration: `{"type": "auth", "payload": {"registration_token": "...", "software_version": "...", "device_type": "appear_x", "protocol_version": 1}}`
+  - Reconnection: `{"type": "auth", "payload": {"node_id": "...", "node_secret": "...", "software_version": "...", "device_type": "appear_x", "protocol_version": 1}}`
 - **10-second auth timeout**
-- **Credential persistence** (`credentials.rs`): after registration, node_id + node_secret saved to JSON file with 0600 permissions
-- **Exponential backoff reconnect**: 1s → 60s doubling, reset on success
+- **Credential persistence** via `CredentialStore` — after registration, node_id + node_secret saved to JSON file with 0600 permissions. The gateway registers an `on_register` callback to trigger the save.
+- **Reconnect backoff**: SDK default 1s → 2s → 5s → 10s → 30s (saturating), reset on successful auth
+- **Multi-URL failover**: rotates through `manager.urls[]` on every WS close
 - **Health heartbeat**: sent every 15 seconds
-- **Command dispatch**: incoming `command` messages forwarded to command handler, `command_ack` sent back
+- **Command dispatch**: `command` envelopes dispatched into `AppearXCommandHandler::handle_command`; `get_config` is routed through `on_config_request` which returns the consolidated state snapshot and the SDK emits the `config_response` envelope + ack.
 
 ### Appear X JSON-RPC Client (`appear_x/jsonrpc.rs`)
 
@@ -146,7 +144,7 @@ TOML config file. See `config/example.toml` for a complete template.
 
 | Setting | Required | Default | Description |
 |---------|----------|---------|-------------|
-| `manager.url` | Yes | — | Manager WebSocket URL (must be `wss://`) |
+| `manager.urls` | Yes | — | Ordered list of manager WebSocket URLs (1–16, each `wss://`) |
 | `manager.registration_token` | First run | — | One-time token from manager "Add Node" |
 | `manager.credentials_file` | No | `credentials.json` | Where to persist node_id + node_secret |
 | `manager.accept_self_signed_cert` | No | `false` | Accept self-signed certs (requires `BILBYCAST_ALLOW_INSECURE=1`) |
@@ -184,19 +182,21 @@ is transparent on the wire. For completeness, the manager-side
 deltas that matter for this sidecar:
 
 - **manager_urls[]** (replaces scalar `manager.url`). Config now
-  takes a list of up to 16 `wss://` URLs. The gateway client
-  rotates through them on WS close with a fixed 5 s backoff —
-  see `ws/client.rs`. Probe mode (`cargo run -- probe ...`) skips
-  URL validation.
+  takes a list of up to 16 `wss://` URLs. The gateway delegates
+  rotation and reconnect to `bilbycast_gateway_sdk::GatewayClient`;
+  the SDK walks the list on every WS close with exponential backoff
+  (1s → 2s → 5s → 10s → 30s, saturating, reset on successful auth).
+  Probe mode (`cargo run -- probe ...`) skips URL validation.
 - **Per-node event rate limit (1000/min).** The manager drops
   excess events silently and synthesises one
   `event_rate_limit_exceeded` per window. The gateway runs its
-  own `ws/event_gate.rs` at 950/min — strictly below the manager
+  own `event_gate.rs` at 950/min — strictly below the manager
   cap so client-side self-gating trips first. When it clamps it
   emits a single `event_rate_limit_selfgate` summary per window
   so the operator sees the exact suppressed count. No change to
   steady-state behaviour; the gate only matters during alarm
-  storms.
+  storms. (The SDK does not currently expose a rate-limit helper;
+  the gate stays in the gateway pending a future SDK release.)
 - **Cross-instance config_fetch RPC** (Phase 2 tail). Added on
   the manager side for HA pairs. The gateway does not implement
   it — when a dashboard on manager A asks for config of a
@@ -231,11 +231,13 @@ Key API modules used by this gateway:
 
 ## Creating Additional Device Gateways
 
-To create a gateway for another 3rd-party device, use this project as a template:
-1. Copy the project structure
-2. Replace `appear_x/` with device-specific modules (API client, polling, command handler)
-3. Update `config.rs` with device-specific settings
-4. Create a matching driver in `bilbycast-manager/crates/manager-core/src/drivers/`
-5. Register the driver in `bilbycast-manager/crates/manager-server/src/main.rs`
+To create a gateway for another 3rd-party device, depend on `bilbycast-gateway-sdk` (see `../bilbycast-gateway-sdk/docs/writing-a-gateway.md`) and:
 
-The `ws/` module (WebSocket client, TLS, message builders) can be reused as-is. When a second gateway exists, consider extracting `ws/` into a shared crate (`bilbycast-gateway-common`).
+1. Add `bilbycast-gateway-sdk = { path = "../bilbycast-gateway-sdk" }` to `Cargo.toml`
+2. Build a `GatewayConfig` from your TOML `[manager]` section
+3. Implement `bilbycast_gateway_sdk::CommandHandler` — this is your vendor translation layer
+4. Spawn your polling task with the `Emitter` returned by `client.emitter()`
+5. Create a matching driver in `bilbycast-manager/crates/manager-core/src/drivers/`
+6. Register the driver in `bilbycast-manager/crates/manager-server/src/main.rs`
+
+All WebSocket / TLS / auth / reconnect / heartbeat / command-ack wiring is owned by the SDK — the gateway only implements the vendor API client, polling loop, and `CommandHandler`.
