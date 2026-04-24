@@ -89,16 +89,6 @@ impl JsonRpcClient {
         Ok(())
     }
 
-    /// Refresh the current session token.
-    pub async fn refresh_session(&self) -> Result<()> {
-        let result = self.call_mmi("mmi:1.0/authentication/RefreshSession", json!({})).await?;
-        if let Some(token) = result.get("accessToken").and_then(|t| t.as_str()) {
-            *self.token.write().await = Some(token.to_string());
-            debug!("Session refreshed");
-        }
-        Ok(())
-    }
-
     /// Call an RPC method on the MMI endpoint.
     pub async fn call_mmi(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}/mmi/api/jsonrpc", self.base_url);
@@ -109,12 +99,6 @@ impl JsonRpcClient {
     pub async fn call_board(&self, slot: u32, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let slot_hex = format!("{:X}", slot);
         let url = format!("{}/board/{}/api/jsonrpc", self.base_url, slot_hex);
-        self.call_rpc(&url, method, params).await
-    }
-
-    /// Call an RPC method on a service endpoint.
-    pub async fn call_service(&self, service_name: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{}/mmi/service_{}/api/jsonrpc", self.base_url, service_name);
         self.call_rpc(&url, method, params).await
     }
 

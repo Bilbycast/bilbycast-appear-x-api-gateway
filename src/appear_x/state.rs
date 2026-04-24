@@ -105,12 +105,6 @@ impl SharedAppearXState {
         }
     }
 
-    /// Expose the capability map so downstream code (polling, commands) can
-    /// look up per-slot discovered modules without cloning the whole map.
-    pub fn capabilities(&self) -> &DeviceCapabilities {
-        &self.caps
-    }
-
     /// Update alarms and return (new_alarms, cleared_alarm_ids) for event
     /// forwarding. An alarm is "new" if its `alarmId` was not in the previous
     /// poll; "cleared" if its previous `alarmId` is no longer present.
