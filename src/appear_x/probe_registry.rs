@@ -16,6 +16,11 @@
 //! The list below is intentionally small and biased toward read-only Get
 //! commands so probing is harmless on a live unit. Add new entries here as new
 //! Appear card families are integrated.
+//!
+//! **Probe-param shapes.** Some Appear modules route the slot via the URL
+//! path (`/board/<hex>/…`) and reject a `slot` key in the JSON-RPC params as
+//! "Struct object has too many members"; others *require* `{"slot": N}` in
+//! params (e.g. `Xger:2.55/cardStatus/GetCardStatus`). See [`ProbeParams`].
 
 /// One probe candidate. The probe asks the unit for
 /// `<interface>:<version>/<module>/<command>` with the `params` body and
@@ -34,23 +39,29 @@ pub struct ProbeEntry {
     pub command: &'static str,
     /// Versions to try, newest first. Probing stops at the first success.
     pub versions: &'static [&'static str],
-    /// Optional JSON params for the probe. `None` means `{}`. Some Get commands
-    /// require a `query: {}` body.
+    /// Shape of the `params` body for the probe — see [`ProbeParams`].
     pub params: ProbeParams,
 }
 
+/// Shape of the JSON-RPC `params` body to send with a probe. Picks between
+/// the three conventions Appear cards actually use on the wire.
 #[derive(Debug, Clone, Copy)]
 pub enum ProbeParams {
+    /// `{}` — most Get* commands.
     Empty,
+    /// `{"query": {}}` — the cross-board services module (`board:*/services/*`).
     EmptyQuery,
+    /// `{"slot": <n>}` — X5/X20 card-manager modules that expect the slot as a
+    /// parameter *in addition to* the URL path (e.g. `Xger:2.55/cardStatus/*`).
+    Slot,
 }
 
 /// All known card-level interfaces to probe per slot. Keep this list focused on
 /// cheap read-only commands.
 ///
 /// Versions are listed newest-first based on the API reference PDFs in
-/// `Appear-X-Platform-API/`. When firmware exposes an older version, probing
-/// will fall through until it finds one that responds.
+/// `Appear-X-Platform-API/` and live-probe evidence. When firmware exposes an
+/// older version, probing will fall through until it finds one that responds.
 pub const CARD_PROBES: &[ProbeEntry] = &[
     // ── Legacy IP Gateway boards (ME-3000 / ME-4000 family). The Integration
     //    Guide example shows ipGateway:1.15. Some firmwares jumped to 1.16+.
@@ -78,121 +89,212 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         versions: &["1.20", "1.16", "1.15", "1.14", "1.10"],
         params: ProbeParams::Empty,
     },
-    // ── IP 2110 encoder card family (Xger reference). The umbrella interface
-    //    is `coderService` plus a series of status interfaces.
+    // ── Cross-board services module (board:*/services/*). Lives under the
+    //    `board` interface alongside ipGateway on ME-3000 / ME-4000 family
+    //    cards. Uses `{query: {}}` params per the Appear X Platform API
+    //    Guide's sample payloads.
     ProbeEntry {
-        family: "Xger",
-        interface: "coderService",
-        module: "coderService",
-        command: "GetCoderServices",
-        versions: &["2.44", "2.43", "2.42", "2.40", "2.36", "2.30", "2.20", "2.10"],
-        params: ProbeParams::Empty,
+        family: "board",
+        interface: "board",
+        module: "services",
+        command: "GetInputServices",
+        versions: &["2.16", "2.8", "4.1", "1.15"],
+        params: ProbeParams::EmptyQuery,
     },
+    // ── X5 / X10 / X20 card-manager surface (Xger interface). Covers chassis
+    //    families where encoder/decoder services are driven through the
+    //    shared card manager rather than a dedicated IP Gateway board. Live
+    //    on firmware like `net.appear.x5.hevc-sdi` / `net.appear.x5.jpegxs-sdi`
+    //    and on commissioned IP 2110 encoders.
+    //
+    //    `cardStatus/GetCardStatus` is the "is there anything alive here"
+    //    probe — it needs `{"slot": N}` in params (slot-in-URL is not enough
+    //    on X5 firmware). Everything else uses `{}` and the URL slot.
     ProbeEntry {
         family: "Xger",
-        interface: "serviceStatus",
-        module: "serviceStatus",
-        command: "GetServiceStatus",
-        versions: &["2.45", "2.40", "2.30", "2.20", "2.10", "2.0", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "Xger",
-        interface: "cardConfig",
-        module: "cardConfig",
-        command: "GetCardConfig",
-        versions: &["1.3", "1.2", "1.1", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "Xger",
-        interface: "cardStatus",
+        interface: "Xger",
         module: "cardStatus",
         command: "GetCardStatus",
-        versions: &["1.9", "1.5", "1.0"],
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.44"],
+        params: ProbeParams::Slot,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "cardAllocation",
+        command: "GetCardAllocations",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
         family: "Xger",
-        interface: "ipInterface",
-        module: "ipInterface",
-        command: "GetIpInterfaces",
-        versions: &["1.6", "1.5", "1.4", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "Xger",
-        interface: "ipConnection",
-        module: "ipConnection",
-        command: "GetIpConnections",
-        versions: &["1.5", "1.4", "1.3", "1.2", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "Xger",
-        interface: "multiService",
+        interface: "Xger",
         module: "multiService",
         command: "GetMultiServices",
-        versions: &["2.16", "2.10", "2.0", "1.0"],
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.16"],
         params: ProbeParams::Empty,
     },
-    // ── JPEG XS encoder family (hipEnc / hipTsEnc references). Modules use
-    //    the `hip<Family><Module>` naming convention.
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "audioProfile",
+        command: "GetAudioProfiles",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.6"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "ipInterface",
+        command: "GetIpInterfaces",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "imageUpload",
+        command: "GetImages",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "poolConfig",
+        command: "GetPoolConfig",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    // `coderService` / `ipConnection` / `lockStatus` are present on fully
+    // commissioned Xger firmware (IP 2110 encoders with an encoder pool) but
+    // not on uncommissioned X5 HEVC SDI units. Probing them lets the gateway
+    // light up richer data when they're there without failing on a bare X5.
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "coderService",
+        command: "GetCoderServices",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.44", "2.40"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "ipConnection",
+        command: "GetIpConnections",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "lockStatus",
+        command: "GetLockStatus",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "psiStatus",
+        command: "GetPsiStatus",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    // ── Pure-JPEG-XS encoder family (hipEnc reference). Modules use the
+    //    `hip<Family><Module>` naming convention on their own interface. Kept
+    //    for units with dedicated JPEG XS boards; ignored on X5 HEVC SDI.
     ProbeEntry {
         family: "hipEnc",
-        interface: "hipCardSettings",
+        interface: "hipEnc",
         module: "hipCardSettings",
         command: "GetCardSettings",
-        versions: &["1.2", "1.0"],
+        versions: &["1.7", "1.5", "1.2", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
         family: "hipEnc",
-        interface: "hipEncoder",
+        interface: "hipEnc",
         module: "hipEncoder",
         command: "GetEncoders",
-        versions: &["1.4", "1.0"],
+        versions: &["1.7", "1.4", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
         family: "hipEnc",
-        interface: "hipIpInterface",
-        module: "hipIpInterface",
-        command: "GetIpInterfaces",
-        versions: &["1.2", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "hipEnc",
-        interface: "hipNetworkStatus",
-        module: "hipNetworkStatus",
-        command: "GetNetworkStatus",
-        versions: &["1.3", "1.0"],
-        params: ProbeParams::Empty,
-    },
-    ProbeEntry {
-        family: "hipEnc",
-        interface: "hipEncStatus",
+        interface: "hipEnc",
         module: "hipEncStatus",
         command: "GetEncoderTransportStatus",
-        versions: &["1.6", "1.4", "1.0"],
+        versions: &["1.7", "1.6", "1.4", "1.0"],
         params: ProbeParams::Empty,
     },
-    // ── SDI JPEG XS Encoder TS family (sdi reference). Uses lowercase modules.
+    ProbeEntry {
+        family: "hipEnc",
+        interface: "hipEnc",
+        module: "hipIpInterface",
+        command: "GetIpInterfaces",
+        versions: &["1.7", "1.2", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "hipEnc",
+        interface: "hipEnc",
+        module: "hipNetworkStatus",
+        command: "GetNetworkStatus",
+        versions: &["1.7", "1.3", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // ── HEVC-TS encoder family (hipTsEnc reference). Product-specific modules
+    //    live on their own interface and are distinct from the Xger card
+    //    manager. If a future X5 firmware exposes them, probing picks them up.
+    ProbeEntry {
+        family: "hipTsEnc",
+        interface: "hipTsEnc",
+        module: "hipTsEncoder",
+        command: "GetEncoders",
+        versions: &["1.11", "1.7", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "hipTsEnc",
+        interface: "hipTsEnc",
+        module: "hipEncStatus",
+        command: "GetEncoderTransportStatus",
+        versions: &["1.11", "1.6", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // ── SDI physical-card family (sdi reference; lowercase modules).
     ProbeEntry {
         family: "sdi",
-        interface: "cardinfo",
+        interface: "sdi",
         module: "cardinfo",
         command: "GetCardInfo",
-        versions: &["1.2", "1.0"],
+        versions: &["1.24", "1.23", "1.18", "1.2", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
         family: "sdi",
-        interface: "cardsettings",
+        interface: "sdi",
         module: "cardsettings",
         command: "GetCardSettings",
-        versions: &["1.0"],
+        versions: &["1.24", "1.23", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "sdi",
+        interface: "sdi",
+        module: "physicalports",
+        command: "GetPhysicalPorts",
+        versions: &["1.24", "1.23", "1.17"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "sdi",
+        interface: "sdi",
+        module: "portstatus",
+        command: "GetPortStatus",
+        versions: &["1.24", "1.23", "1.20"],
         params: ProbeParams::Empty,
     },
 ];

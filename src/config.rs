@@ -82,14 +82,44 @@ pub struct PollingConfig {
     /// Polling interval (seconds) for `cards/GetChassisInfo` + `cards/GetCardStates`.
     #[serde(default = "default_30")]
     pub cards_interval_secs: u64,
+
+    /// Polling interval (seconds) for the fast `Xger:*/cardStatus/GetCardStatus`
+    /// poll per populated slot. Drives the broadcast-engineer Card Health
+    /// panel on the manager — keep short (≤ 5 s) so PTP drop / SFP RX power
+    /// loss surfaces quickly.
+    #[serde(default = "default_5")]
+    pub card_status_interval_secs: u64,
+
+    /// Polling interval (seconds) for the slower Xger Get* calls (coder
+    /// services, multi services, audio profiles, IP interfaces, card
+    /// allocations, pool config). These are config surfaces — they only
+    /// change when the operator changes them.
+    #[serde(default = "default_30")]
+    pub xger_config_interval_secs: u64,
+
+    /// Rx optical-power threshold in dBm. When *any* populated optical port
+    /// drops below this, the gateway emits a Minor `sfp_low_rx_power` event.
+    /// The industry-standard SFP+ receiver sensitivity floor is around
+    /// -14 dBm for 10 G-SR; -18 dBm is the default early-warning trigger.
+    #[serde(default = "default_rx_threshold")]
+    pub sfp_low_rx_dbm_threshold: f64,
+
+    /// Maximum SFP cage temperature (°C) before the gateway emits a Minor
+    /// `sfp_high_temperature` event. QSFP+ modules typically list 70–75 °C
+    /// as the commercial limit; 70 °C is a conservative early warning.
+    #[serde(default = "default_temp_threshold")]
+    pub sfp_high_temp_c_threshold: f64,
 }
 
 fn default_10() -> u64 { 10 }
 fn default_15() -> u64 { 15 }
 fn default_30() -> u64 { 30 }
+fn default_5() -> u64 { 5 }
 fn default_alarms_mmi_version() -> String { "2.8".into() }
 fn default_chassis_mmi_version() -> String { "4.1".into() }
 fn default_cards_mmi_version() -> String { "2.8".into() }
+fn default_rx_threshold() -> f64 { -18.0 }
+fn default_temp_threshold() -> f64 { 70.0 }
 
 impl AppConfig {
     /// Load the config, optionally skipping the manager URL validation.

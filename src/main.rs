@@ -290,18 +290,81 @@ async fn run_probe(cfg: &config::AppConfig) -> Result<()> {
         if !slot_caps.features.is_empty() {
             println!("         features: {}", slot_caps.features.join(", "));
         }
-        if slot_caps.discovered_interfaces.is_empty() {
+        if slot_caps.discovered_modules.is_empty() {
             println!(
-                "         no card-level interfaces matched the probe registry — \
+                "         no card-level modules matched the probe registry — \
                  this firmware uses a namespace not yet registered in \
                  src/appear_x/probe_registry.rs"
             );
         } else {
-            for (iface, rec) in &slot_caps.discovered_interfaces {
+            for (key, rec) in &slot_caps.discovered_modules {
                 println!(
-                    "         ✓ {iface}:{} (family={}) via {}",
-                    rec.version, rec.family, rec.probe_method
+                    "         ✓ {}:{}  (family={})  via {}",
+                    key, rec.version, rec.family, rec.probe_method
                 );
+            }
+        }
+    }
+
+    // Extra: hit each discovered Xger module once and surface the broadcast-
+    // critical signals broadcast engineers care about (PTP lock, SFP RX
+    // power, SFP temperature). Runs independently per slot so one dead
+    // module doesn't kill the whole report.
+    println!();
+    println!("Xger health snapshot (one-shot per slot):");
+    for (slot, slot_caps) in &caps.slots {
+        if slot_caps.discovered_modules.is_empty() {
+            continue;
+        }
+        println!("  Slot {slot}:");
+        let ver = slot_caps
+            .any_interface_version("Xger")
+            .unwrap_or("2.55");
+        // Card status — PTP + SFP
+        let cs_method = format!("Xger:{ver}/cardStatus/GetCardStatus");
+        match client
+            .call_board(*slot, &cs_method, json!({"slot": slot}))
+            .await
+        {
+            Ok(v) => print_card_status_summary(&v),
+            Err(e) => println!("    cardStatus failed: {e}"),
+        }
+        // One-liner for each other probed module
+        for (key, rec) in &slot_caps.discovered_modules {
+            if key == "Xger/cardStatus" {
+                continue;
+            }
+            let (module, command) = match key.split_once('/') {
+                Some((_, m)) => match m {
+                    "cardAllocation" => (m, "GetCardAllocations"),
+                    "multiService" => (m, "GetMultiServices"),
+                    "audioProfile" => (m, "GetAudioProfiles"),
+                    "ipInterface" => (m, "GetIpInterfaces"),
+                    "imageUpload" => (m, "GetImages"),
+                    "poolConfig" => (m, "GetPoolConfig"),
+                    "coderService" => (m, "GetCoderServices"),
+                    "ipConnection" => (m, "GetIpConnections"),
+                    "lockStatus" => (m, "GetLockStatus"),
+                    "psiStatus" => (m, "GetPsiStatus"),
+                    _ => continue,
+                },
+                None => continue,
+            };
+            let method = format!("Xger:{}/{}/{}", rec.version, module, command);
+            match client.call_board(*slot, &method, json!({})).await {
+                Ok(v) => {
+                    let count = v
+                        .get("data")
+                        .and_then(|d| d.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let size = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+                    println!(
+                        "    {:20} OK  (data.len={count}, response bytes={size})",
+                        module
+                    );
+                }
+                Err(e) => println!("    {:20} ERR {}", module, e),
             }
         }
     }
@@ -309,4 +372,85 @@ async fn run_probe(cfg: &config::AppConfig) -> Result<()> {
     println!();
     println!("Probe complete.");
     Ok(())
+}
+
+/// Format a `cardStatus` result for the human probe report — pulls out the
+/// three things broadcast engineers actually ask about: PTP lock, worst SFP
+/// RX optical power, max SFP temperature.
+fn print_card_status_summary(status: &serde_json::Value) {
+    // PTP
+    let ptp = status
+        .get("ptpLock")
+        .and_then(|pl| {
+            if pl.is_object() && pl.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                Some("no-signal".to_string())
+            } else {
+                pl.get("state")
+                    .or_else(|| pl.pointer("/value/state"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+        })
+        .unwrap_or_else(|| "unknown".into());
+    println!("    cardStatus          OK  ptp={ptp}");
+
+    let mut rx_min: Option<f64> = None;
+    let mut temp_max: Option<f64> = None;
+    let qsfp = status.pointer("/qsfpStatus/value").and_then(|v| v.as_array());
+    let sfp = status.pointer("/sfpStatus/value").and_then(|v| v.as_array());
+    for arr in [qsfp, sfp].into_iter().flatten() {
+        for entry in arr {
+            let port = entry
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let diag = entry.pointer("/value/diagnostics/value");
+            if let Some(d) = diag {
+                let temp = d.get("temp").and_then(|v| v.as_f64());
+                let rx: Vec<f64> = d
+                    .get("rxPwr")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+                    .unwrap_or_default();
+                let rx_dbm: Vec<String> = rx
+                    .iter()
+                    .map(|mw| {
+                        if *mw > 0.0 {
+                            format!("{:.1}dBm", 10.0 * mw.log10())
+                        } else {
+                            "--".to_string()
+                        }
+                    })
+                    .collect();
+                if let Some(t) = temp {
+                    temp_max = Some(match temp_max {
+                        Some(v) => v.max(t),
+                        None => t,
+                    });
+                }
+                for mw in &rx {
+                    if *mw > 0.0 {
+                        let dbm = 10.0 * mw.log10();
+                        rx_min = Some(match rx_min {
+                            Some(v) => v.min(dbm),
+                            None => dbm,
+                        });
+                    }
+                }
+                println!(
+                    "      port {port}: temp={}  rx=[{}]",
+                    temp.map(|t| format!("{t:.1}°C")).unwrap_or_else(|| "?".into()),
+                    rx_dbm.join(", ")
+                );
+            }
+        }
+    }
+    let rx_s = rx_min
+        .map(|v| format!("{v:.1} dBm"))
+        .unwrap_or_else(|| "no-signal".into());
+    let temp_s = temp_max
+        .map(|v| format!("{v:.1} °C"))
+        .unwrap_or_else(|| "-".into());
+    println!("    → worst_rx={rx_s}  max_temp={temp_s}");
 }

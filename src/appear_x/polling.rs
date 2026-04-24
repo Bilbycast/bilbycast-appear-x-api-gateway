@@ -9,8 +9,14 @@
 //! This avoids the "last payload wins" problem on the manager side, where
 //! every separate `stats` message would overwrite the previous one in
 //! `cached_stats`. The manager-side dashboard always sees a complete picture
-//! (chassis + slots + inputs + outputs + ip_interfaces + alarms) in a single
-//! payload.
+//! (chassis + slots + inputs + outputs + ip_interfaces + alarms + card
+//! status + coder services + audio profiles + …) in a single payload.
+//!
+//! Per-slot Xger pollers emit synthetic Critical / Minor events when
+//! broadcast-critical signals flip (PTP lock lost/regained, SFP low optical
+//! RX power, SFP over-temperature). These event edges are computed against
+//! the prior `cardStatus` snapshot — the threshold crossing is only emitted
+//! on the edge, so steady-state alerts do not flood the manager.
 
 use anyhow::Result;
 use bilbycast_gateway_sdk::{Emitter, EventSeverity, GatewayEvent};
@@ -35,9 +41,9 @@ const STATS_EMIT_INTERVAL_SECS: u64 = 5;
 ///
 /// `caps` is the result of [`crate::appear_x::capabilities::discover`] and
 /// drives which per-slot tasks are spawned. Per-slot polling is only set up
-/// for slots whose discovery actually found a matching card-level interface
-/// (e.g. `ipGateway`); slots whose card software uses an unknown namespace
-/// silently skip per-slot polling rather than spamming "Method not found".
+/// for slots whose discovery actually found matching modules; slots whose
+/// card software uses an unknown namespace silently skip per-slot polling
+/// rather than spamming "Method not found".
 pub async fn run_polling(
     client: JsonRpcClient,
     config: PollingConfig,
@@ -59,164 +65,13 @@ pub async fn run_polling(
     // this lives locally. See `event_gate.rs` for the full rationale.
     let event_gate = Arc::new(EventGate::new());
 
-    // Spawn alarm polling (MMI endpoint).
-    //
-    // The alarm poller is special: in addition to writing into the shared
-    // state, it ALSO sends an immediate `health` envelope to the manager so
-    // alarm-driven health flips ("ok" → "critical") are visible without
-    // waiting for the next stats emit tick.
-    let alarms_method = format!("mmi:{}/alarms/GetActiveAlarms", config.alarms_mmi_version);
-    spawn_state_poll(
-        client.clone(),
-        state.clone(),
-        cancel.child_token(),
-        config.alarms_interval_secs,
-        "alarms",
-        {
-            let emitter = emitter.clone();
-            let event_gate = event_gate.clone();
-            move |c, st| {
-                let alarms_method = alarms_method.clone();
-                let emitter = emitter.clone();
-                let event_gate = event_gate.clone();
-                Box::pin(async move {
-                    let result = c.call_mmi(&alarms_method, json!({"query": {}})).await?;
-                    let alarms_value = result.get("data").cloned().unwrap_or(json!([]));
-                    let alarm_list: Vec<Value> =
-                        alarms_value.as_array().cloned().unwrap_or_default();
+    spawn_alarms_poller(&client, &config, &state, &emitter, &event_gate, &cancel);
+    spawn_chassis_poller(&client, &config, &state, &cancel);
+    spawn_cards_poller(&client, &config, &state, &cancel);
 
-                    let status = derive_status(&alarm_list);
-                    let (new_alarms, cleared_ids) =
-                        st.set_alarms(alarm_list, status).await;
-
-                    // Emit manager events for newly raised alarms.
-                    for alarm in &new_alarms {
-                        let severity = alarm
-                            .get("severity")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("UNKNOWN");
-                        let alarm_id = alarm
-                            .get("alarmId")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("unknown");
-                        let alarm_name = alarm
-                            .get("alarmName")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
-                        let description = alarm
-                            .get("alarmDescription")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
-                        let slot = alarm
-                            .get("configObjectSlot")
-                            .and_then(|s| s.as_u64());
-                        let object_label = alarm
-                            .get("configObjectLabel")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
-                        let event_severity = match severity {
-                            "CRITICAL" | "MAJOR" => EventSeverity::Critical,
-                            "MINOR" | "WARNING" => EventSeverity::Minor,
-                            _ => EventSeverity::Info,
-                        };
-                        let message = if alarm_name.is_empty() {
-                            format!("Alarm raised: {description}")
-                        } else {
-                            format!("Alarm raised: {alarm_name} — {description}")
-                        };
-                        let mut details = json!({
-                            "alarm_id": alarm_id,
-                            "severity": severity,
-                        });
-                        if let Some(s) = slot {
-                            details["slot"] = json!(s);
-                        }
-                        if !object_label.is_empty() {
-                            details["object"] = json!(object_label);
-                        }
-                        let event = GatewayEvent::new(event_severity, "alarm", message)
-                            .with_details(details);
-                        emit_gated_event(&emitter, &event_gate, event).await;
-                    }
-
-                    // Emit info events for cleared alarms.
-                    for alarm_id in &cleared_ids {
-                        let event = GatewayEvent::info(
-                            "alarm",
-                            format!("Alarm cleared: {alarm_id}"),
-                        )
-                        .with_details(json!({ "alarm_id": alarm_id }));
-                        emit_gated_event(&emitter, &event_gate, event).await;
-                    }
-
-                    // Push a fast `health` notification so the dashboard pill
-                    // updates between stats emit ticks.
-                    let health = json!({
-                        "status": status,
-                        "alarms": alarms_value,
-                        "version": env!("CARGO_PKG_VERSION"),
-                    });
-                    let _ = emitter.emit_health(health).await;
-                    Ok(())
-                })
-            }
-        },
-    );
-
-    // Spawn chassis polling (MMI endpoint)
-    let chassis_method = format!("mmi:{}/chassisModel/GetGraph", config.chassis_mmi_version);
-    spawn_state_poll(
-        client.clone(),
-        state.clone(),
-        cancel.child_token(),
-        config.chassis_interval_secs,
-        "chassis",
-        move |c, st| {
-            let chassis_method = chassis_method.clone();
-            Box::pin(async move {
-                let result = c.call_mmi(&chassis_method, json!({})).await?;
-                st.set_chassis(result).await;
-                Ok(())
-            })
-        },
-    );
-
-    // Spawn cards polling (chassis-info + per-slot card software state).
-    // This is the canonical source of per-slot info on X5 / X20 firmware
-    // (`cards/GetChassisInfo` and `cards/GetCardStates`) and is independent of
-    // the per-board ipGateway polling, which only applies to certain card types.
-    let cards_info_method = format!("mmi:{}/cards/GetChassisInfo", config.cards_mmi_version);
-    let cards_state_method = format!("mmi:{}/cards/GetCardStates", config.cards_mmi_version);
-    spawn_state_poll(
-        client.clone(),
-        state.clone(),
-        cancel.child_token(),
-        config.cards_interval_secs,
-        "cards",
-        move |c, st| {
-            let cards_info_method = cards_info_method.clone();
-            let cards_state_method = cards_state_method.clone();
-            Box::pin(async move {
-                let info = c.call_mmi(&cards_info_method, json!({})).await?;
-                let states = c.call_mmi(&cards_state_method, json!({})).await?;
-                st.set_cards(
-                    info.get("data").cloned().unwrap_or(json!({})),
-                    states.get("cards").cloned().unwrap_or(json!([])),
-                )
-                .await;
-                Ok(())
-            })
-        },
-    );
-
-    // Spawn per-slot polling, gated on what discovery actually found.
-    //
-    // For each slot we walk the discovered interfaces and only spawn pollers
-    // backed by interface families this firmware confirmed it speaks. Slots on
-    // card softwares whose namespace isn't yet in `probe_registry::CARD_PROBES`
-    // (e.g. the X5 HEVC SDI demo unit at the time of writing) silently
-    // contribute zero per-slot pollers, while still being reported through the
-    // chassis-level alarms / chassisModel / cards polls above.
+    // Per-slot polling, gated by discovery. For each slot we walk the
+    // discovered modules and only spawn pollers backed by modules this
+    // firmware confirmed it speaks.
     info!(
         "Setting up per-slot polling for {} slot(s) on {} chassis",
         caps.slots.len(),
@@ -224,9 +79,9 @@ pub async fn run_polling(
     );
     for (slot, slot_caps) in &caps.slots {
         let slot = *slot;
-        if slot_caps.discovered_interfaces.is_empty() {
+        if slot_caps.discovered_modules.is_empty() {
             warn!(
-                "Slot {} ({}, software_id={:?}): no card-level interfaces matched the \
+                "Slot {} ({}, software_id={:?}): no card-level modules matched the \
                  probe registry — only chassis-level polls will report data for this slot. \
                  To add support, register the firmware's namespace in \
                  src/appear_x/probe_registry.rs.",
@@ -235,76 +90,86 @@ pub async fn run_polling(
             continue;
         }
 
-        // Legacy IP Gateway boards (ME-3000 / ME-4000 family).
-        if let Some(rec) = slot_caps.discovered_interfaces.get("ipGateway") {
-            let version = rec.version.clone();
-            info!(
-                "Slot {}: spawning ipGateway pollers (version {})",
-                slot, version
-            );
+        // Summarise what we're about to poll on this slot so operators can
+        // verify the probe registry in the log.
+        let families: Vec<&str> = {
+            let mut f: Vec<&str> = slot_caps
+                .discovered_modules
+                .values()
+                .map(|r| r.family.as_str())
+                .collect();
+            f.sort();
+            f.dedup();
+            f
+        };
+        info!("Slot {slot}: polling families = {families:?}");
 
-            // Input polling
-            let v = version.clone();
+        // ── ipGateway (legacy IP Gateway boards — ME-3000 / ME-4000 family)
+        if slot_caps.has_module("ipGateway", "input") {
+            let v = slot_caps
+                .module_version("ipGateway", "input")
+                .unwrap_or("1.15")
+                .to_string();
             spawn_state_poll(
                 client.clone(),
                 state.clone(),
                 cancel.child_token(),
                 config.inputs_interval_secs,
-                &format!("inputs-slot{}", slot),
+                &format!("ipgw-inputs-slot{slot}"),
                 move |c, st| {
                     let v = v.clone();
                     Box::pin(async move {
-                        let method = format!("ipGateway:{}/input/GetInputs", v);
-                        let result = c.call_board(slot, &method, json!({})).await?;
-                        st.set_slot_inputs(
-                            slot,
-                            result.get("data").cloned().unwrap_or(json!([])),
-                        )
-                        .await;
+                        let method = format!("ipGateway:{v}/input/GetInputs");
+                        let r = c.call_board(slot, &method, json!({})).await?;
+                        st.set_slot_inputs(slot, r.get("data").cloned().unwrap_or(json!([])))
+                            .await;
                         Ok(())
                     })
                 },
             );
-
-            // Output polling
-            let v = version.clone();
+        }
+        if slot_caps.has_module("ipGateway", "output") {
+            let v = slot_caps
+                .module_version("ipGateway", "output")
+                .unwrap_or("1.15")
+                .to_string();
             spawn_state_poll(
                 client.clone(),
                 state.clone(),
                 cancel.child_token(),
                 config.outputs_interval_secs,
-                &format!("outputs-slot{}", slot),
+                &format!("ipgw-outputs-slot{slot}"),
                 move |c, st| {
                     let v = v.clone();
                     Box::pin(async move {
-                        let method = format!("ipGateway:{}/output/GetOutputs", v);
-                        let result = c.call_board(slot, &method, json!({})).await?;
-                        st.set_slot_outputs(
-                            slot,
-                            result.get("data").cloned().unwrap_or(json!([])),
-                        )
-                        .await;
+                        let method = format!("ipGateway:{v}/output/GetOutputs");
+                        let r = c.call_board(slot, &method, json!({})).await?;
+                        st.set_slot_outputs(slot, r.get("data").cloned().unwrap_or(json!([])))
+                            .await;
                         Ok(())
                     })
                 },
             );
-
-            // IP interfaces polling
-            let v = version.clone();
+        }
+        if slot_caps.has_module("ipGateway", "ipinterface") {
+            let v = slot_caps
+                .module_version("ipGateway", "ipinterface")
+                .unwrap_or("1.15")
+                .to_string();
             spawn_state_poll(
                 client.clone(),
                 state.clone(),
                 cancel.child_token(),
-                config.inputs_interval_secs * 2, // less frequent
-                &format!("interfaces-slot{}", slot),
+                config.inputs_interval_secs * 2,
+                &format!("ipgw-ifaces-slot{slot}"),
                 move |c, st| {
                     let v = v.clone();
                     Box::pin(async move {
-                        let method = format!("ipGateway:{}/ipinterface/GetIpInterfaces", v);
-                        let result = c.call_board(slot, &method, json!({})).await?;
+                        let method = format!("ipGateway:{v}/ipinterface/GetIpInterfaces");
+                        let r = c.call_board(slot, &method, json!({})).await?;
                         st.set_slot_ip_interfaces(
                             slot,
-                            result.get("data").cloned().unwrap_or(json!([])),
+                            r.get("data").cloned().unwrap_or(json!([])),
                         )
                         .await;
                         Ok(())
@@ -313,11 +178,209 @@ pub async fn run_polling(
             );
         }
 
-        // Note: per-card-family polling for the Xger (IP 2110), hipEnc (JPEG XS),
-        // and `sdi` (SDI JPEG XS) families is registered for discovery but not
-        // yet wired up to dedicated pollers here. Once a real test unit of one
-        // of those families is available, add a branch above analogous to the
-        // `ipGateway` block.
+        // ── Xger card-manager surface (X5 / X10 / X20 chassis; commissioned
+        //    IP 2110 encoders). The fast `cardStatus` poller also drives
+        //    broadcast-critical synthetic events (PTP / SFP). Slow pollers
+        //    only spawn for modules that responded at discovery.
+        if slot_caps.has_module("Xger", "cardStatus") {
+            let v = slot_caps
+                .module_version("Xger", "cardStatus")
+                .unwrap_or("2.55")
+                .to_string();
+            let emitter = emitter.clone();
+            let event_gate = event_gate.clone();
+            let rx_thresh = config.sfp_low_rx_dbm_threshold;
+            let temp_thresh = config.sfp_high_temp_c_threshold;
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                config.card_status_interval_secs,
+                &format!("xger-cardstatus-slot{slot}"),
+                move |c, st| {
+                    let v = v.clone();
+                    let emitter = emitter.clone();
+                    let event_gate = event_gate.clone();
+                    Box::pin(async move {
+                        let method = format!("Xger:{v}/cardStatus/GetCardStatus");
+                        let r = c.call_board(slot, &method, json!({"slot": slot})).await?;
+                        let prior = st.set_card_status(slot, r.clone()).await;
+                        let events = derive_card_status_events(slot, prior.as_ref(), &r, rx_thresh, temp_thresh);
+                        for ev in events {
+                            emit_gated_event(&emitter, &event_gate, ev).await;
+                        }
+                        Ok(())
+                    })
+                },
+            );
+        }
+
+        // Slow Xger config pollers — spawn only for discovered modules.
+        let slow = config.xger_config_interval_secs;
+
+        spawn_xger_slow(
+            slot_caps,
+            "coderService",
+            "GetCoderServices",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_coder_services(slot, data).await;
+                });
+            },
+        );
+        spawn_xger_slow(
+            slot_caps,
+            "multiService",
+            "GetMultiServices",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_multi_services(slot, data).await;
+                });
+            },
+        );
+        spawn_xger_slow(
+            slot_caps,
+            "audioProfile",
+            "GetAudioProfiles",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_audio_profiles(slot, data).await;
+                });
+            },
+        );
+        spawn_xger_slow(
+            slot_caps,
+            "ipInterface",
+            "GetIpInterfaces",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_xger_ip_interfaces(slot, data).await;
+                });
+            },
+        );
+        spawn_xger_slow(
+            slot_caps,
+            "cardAllocation",
+            "GetCardAllocations",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_card_allocations(slot, data).await;
+                });
+            },
+        );
+
+        // poolConfig / lockStatus / psiStatus — single-object returns (not
+        // arrays). Use the raw `result` blob.
+        spawn_xger_slow_raw(
+            slot_caps,
+            "poolConfig",
+            "GetPoolConfig",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_pool_config(slot, raw).await;
+                });
+            },
+        );
+        spawn_xger_slow_raw(
+            slot_caps,
+            "lockStatus",
+            "GetLockStatus",
+            &client,
+            &state,
+            &cancel,
+            config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_lock_status(slot, raw).await;
+                });
+            },
+        );
+        spawn_xger_slow_raw(
+            slot_caps,
+            "psiStatus",
+            "GetPsiStatus",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_psi_status(slot, raw).await;
+                });
+            },
+        );
+
+        // ── board:{ver}/services/GetOutputServices ───────────────────
+        //
+        // On the X5 / X10 / X20 card-manager firmware the `Xger:*/ipConnection`
+        // module isn't loaded (the X5 HEVC SDI only exposes 7 Xger modules;
+        // ipConnection is not among them). The native Appear X web UI still
+        // shows IP outputs though — it pulls them from the `board:*/services`
+        // module via `GetOutputServices`, which returns entries with
+        // `nodeType: Flow::FlowSink::IpOutput::` and a nested `sources` list
+        // pointing at the input service feeding each leg. SMPTE 2022-7
+        // redundant pairs surface as two entries with the same label / name
+        // and different `body.address` — the manager UI groups them visually.
+        // Gate on `board/services` discovery; skip if the card only speaks
+        // legacy `ipGateway` (GetOutputs already covers that path).
+        if slot_caps.has_module("board", "services") {
+            let v = slot_caps
+                .module_version("board", "services")
+                .unwrap_or("2.16")
+                .to_string();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                slow,
+                &format!("board-output-services-slot{slot}"),
+                move |c, st| {
+                    let v = v.clone();
+                    Box::pin(async move {
+                        let method = format!("board:{v}/services/GetOutputServices");
+                        let r = c.call_board(slot, &method, json!({})).await?;
+                        st.set_output_services(
+                            slot,
+                            r.get("data").cloned().unwrap_or(json!([])),
+                        )
+                        .await;
+                        Ok(())
+                    })
+                },
+            );
+        }
     }
 
     // Single consolidated stats emitter — snapshots SharedAppearXState every
@@ -350,6 +413,410 @@ pub async fn run_polling(
     Ok(())
 }
 
+/// Spawn the `cardStatus` independent "alarms" poller that also emits a
+/// `health` envelope on every tick.
+fn spawn_alarms_poller(
+    client: &JsonRpcClient,
+    config: &PollingConfig,
+    state: &SharedAppearXState,
+    emitter: &Emitter,
+    event_gate: &Arc<EventGate>,
+    cancel: &CancellationToken,
+) {
+    let alarms_method = format!("mmi:{}/alarms/GetActiveAlarms", config.alarms_mmi_version);
+    let emitter = emitter.clone();
+    let event_gate = event_gate.clone();
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        config.alarms_interval_secs,
+        "alarms",
+        move |c, st| {
+            let alarms_method = alarms_method.clone();
+            let emitter = emitter.clone();
+            let event_gate = event_gate.clone();
+            Box::pin(async move {
+                let result = c.call_mmi(&alarms_method, json!({"query": {}})).await?;
+                let alarms_value = result.get("data").cloned().unwrap_or(json!([]));
+                let alarm_list: Vec<Value> =
+                    alarms_value.as_array().cloned().unwrap_or_default();
+
+                let status = derive_status(&alarm_list);
+                let (new_alarms, cleared_ids) = st.set_alarms(alarm_list, status).await;
+
+                for alarm in &new_alarms {
+                    let severity = alarm
+                        .get("severity")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("UNKNOWN");
+                    let alarm_id = alarm
+                        .get("alarmId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    let alarm_name = alarm
+                        .get("alarmName")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let description = alarm
+                        .get("alarmDescription")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let slot = alarm
+                        .get("configObjectSlot")
+                        .and_then(|s| s.as_u64());
+                    let object_label = alarm
+                        .get("configObjectLabel")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let object_type = alarm
+                        .get("configObjectType")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let object_id = alarm
+                        .get("configObjectId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let event_severity = match severity {
+                        "CRITICAL" | "MAJOR" => EventSeverity::Critical,
+                        "MINOR" | "WARNING" => EventSeverity::Minor,
+                        _ => EventSeverity::Info,
+                    };
+                    let message = if alarm_name.is_empty() {
+                        format!("Alarm raised: {description}")
+                    } else {
+                        format!("Alarm raised: {alarm_name} — {description}")
+                    };
+                    let mut details = json!({
+                        "alarm_id": alarm_id,
+                        "severity": severity,
+                    });
+                    if let Some(s) = slot {
+                        details["slot"] = json!(s);
+                    }
+                    if !object_label.is_empty() {
+                        details["object_label"] = json!(object_label);
+                    }
+                    if !object_type.is_empty() {
+                        details["object_type"] = json!(object_type);
+                    }
+                    if !object_id.is_empty() {
+                        details["object_id"] = json!(object_id);
+                    }
+                    let event = GatewayEvent::new(event_severity, "alarm", message)
+                        .with_details(details);
+                    emit_gated_event(&emitter, &event_gate, event).await;
+                }
+
+                for alarm_id in &cleared_ids {
+                    let event = GatewayEvent::info(
+                        "alarm",
+                        format!("Alarm cleared: {alarm_id}"),
+                    )
+                    .with_details(json!({ "alarm_id": alarm_id }));
+                    emit_gated_event(&emitter, &event_gate, event).await;
+                }
+
+                let health = json!({
+                    "status": status,
+                    "alarms": alarms_value,
+                    "version": env!("CARGO_PKG_VERSION"),
+                });
+                let _ = emitter.emit_health(health).await;
+                Ok(())
+            })
+        },
+    );
+}
+
+fn spawn_chassis_poller(
+    client: &JsonRpcClient,
+    config: &PollingConfig,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+) {
+    let method = format!("mmi:{}/chassisModel/GetGraph", config.chassis_mmi_version);
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        config.chassis_interval_secs,
+        "chassis",
+        move |c, st| {
+            let method = method.clone();
+            Box::pin(async move {
+                let r = c.call_mmi(&method, json!({})).await?;
+                st.set_chassis(r).await;
+                Ok(())
+            })
+        },
+    );
+}
+
+fn spawn_cards_poller(
+    client: &JsonRpcClient,
+    config: &PollingConfig,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+) {
+    let info_m = format!("mmi:{}/cards/GetChassisInfo", config.cards_mmi_version);
+    let states_m = format!("mmi:{}/cards/GetCardStates", config.cards_mmi_version);
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        config.cards_interval_secs,
+        "cards",
+        move |c, st| {
+            let info_m = info_m.clone();
+            let states_m = states_m.clone();
+            Box::pin(async move {
+                let info = c.call_mmi(&info_m, json!({})).await?;
+                let states = c.call_mmi(&states_m, json!({})).await?;
+                st.set_cards(
+                    info.get("data").cloned().unwrap_or(json!({})),
+                    states.get("cards").cloned().unwrap_or(json!([])),
+                )
+                .await;
+                Ok(())
+            })
+        },
+    );
+}
+
+/// Spawn a per-slot Xger poller that extracts `result.data` as an array and
+/// calls the provided setter. No-op if the slot didn't discover the module.
+fn spawn_xger_slow<F>(
+    slot_caps: &super::capabilities::SlotCapabilities,
+    module: &'static str,
+    command: &'static str,
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+    interval_secs: u64,
+    apply: F,
+) where
+    F: Fn(SharedAppearXState, u32, Value) + Send + Sync + 'static + Clone,
+{
+    let slot = slot_caps.slot;
+    let version = match slot_caps.module_version("Xger", module) {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    let apply = apply.clone();
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        interval_secs,
+        &format!("xger-{module}-slot{slot}"),
+        move |c, st| {
+            let version = version.clone();
+            let apply = apply.clone();
+            Box::pin(async move {
+                let method = format!("Xger:{version}/{module}/{command}");
+                let r = c.call_board(slot, &method, json!({})).await?;
+                let data = r.get("data").cloned().unwrap_or(json!([]));
+                apply(st, slot, data);
+                Ok(())
+            })
+        },
+    );
+}
+
+/// Like `spawn_xger_slow` but for commands whose result is a single opaque
+/// object instead of `{ data: [] }`. Gets the whole `result` blob.
+fn spawn_xger_slow_raw<F>(
+    slot_caps: &super::capabilities::SlotCapabilities,
+    module: &'static str,
+    command: &'static str,
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+    interval_secs: u64,
+    apply: F,
+) where
+    F: Fn(SharedAppearXState, u32, Value) + Send + Sync + 'static + Clone,
+{
+    let slot = slot_caps.slot;
+    let version = match slot_caps.module_version("Xger", module) {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    let apply = apply.clone();
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        interval_secs,
+        &format!("xger-{module}-slot{slot}"),
+        move |c, st| {
+            let version = version.clone();
+            let apply = apply.clone();
+            Box::pin(async move {
+                let method = format!("Xger:{version}/{module}/{command}");
+                let r = c.call_board(slot, &method, json!({})).await?;
+                apply(st, slot, r);
+                Ok(())
+            })
+        },
+    );
+}
+
+/// Compare previous and current `cardStatus` snapshots for a single slot and
+/// emit synthetic Critical / Minor events on threshold crossings. Only the
+/// *edges* fire — a port that has been below the RX-power threshold for 10
+/// minutes does NOT emit an event every poll tick.
+///
+/// Detections:
+/// - PTP `LOCKED` → anything else  (Critical `ptp_lost`)
+/// - PTP anything else → `LOCKED`  (Info `ptp_locked`)
+/// - SFP RX dBm crossing below `rx_thresh` while optic is present (Minor `sfp_low_rx`)
+/// - SFP temp crossing above `temp_thresh`                            (Minor `sfp_high_temperature`)
+fn derive_card_status_events(
+    slot: u32,
+    prev: Option<&Value>,
+    curr: &Value,
+    rx_thresh: f64,
+    temp_thresh: f64,
+) -> Vec<GatewayEvent> {
+    let mut events = Vec::new();
+
+    let prev_ptp = prev.and_then(|p| ptp_state_of(p));
+    let curr_ptp = ptp_state_of(curr);
+    let (prev_locked, curr_locked) = (prev_ptp.as_deref() == Some("LOCKED"), curr_ptp.as_deref() == Some("LOCKED"));
+    if prev.is_some() && prev_locked && !curr_locked {
+        events.push(
+            GatewayEvent::new(
+                EventSeverity::Critical,
+                "ptp",
+                format!("PTP lock lost on slot {slot} (state={})", curr_ptp.clone().unwrap_or_else(|| "unknown".into())),
+            )
+            .with_details(json!({ "slot": slot, "state": curr_ptp, "error_code": "ptp_lost" })),
+        );
+    } else if prev.is_some() && !prev_locked && curr_locked {
+        events.push(
+            GatewayEvent::info(
+                "ptp",
+                format!("PTP locked on slot {slot}"),
+            )
+            .with_details(json!({ "slot": slot, "state": "LOCKED" })),
+        );
+    }
+
+    let prev_rx = prev.and_then(min_rx_dbm);
+    let curr_rx = min_rx_dbm(curr);
+    if let Some(curr_min) = curr_rx {
+        let was_below = prev_rx.map(|p| p < rx_thresh).unwrap_or(false);
+        let now_below = curr_min < rx_thresh;
+        if now_below && !was_below {
+            events.push(
+                GatewayEvent::new(
+                    EventSeverity::Minor,
+                    "sfp",
+                    format!(
+                        "SFP RX optical power on slot {slot} is below {rx_thresh:.1} dBm (current min {curr_min:.1} dBm)"
+                    ),
+                )
+                .with_details(json!({
+                    "slot": slot,
+                    "rx_power_dbm_min": curr_min,
+                    "threshold_dbm": rx_thresh,
+                    "error_code": "sfp_low_rx_power",
+                })),
+            );
+        } else if !now_below && was_below {
+            events.push(
+                GatewayEvent::info(
+                    "sfp",
+                    format!("SFP RX optical power recovered on slot {slot} (current min {curr_min:.1} dBm)"),
+                )
+                .with_details(json!({ "slot": slot, "rx_power_dbm_min": curr_min })),
+            );
+        }
+    }
+
+    let prev_temp = prev.and_then(max_temp);
+    let curr_temp = max_temp(curr);
+    if let Some(curr_max) = curr_temp {
+        let was_over = prev_temp.map(|p| p > temp_thresh).unwrap_or(false);
+        let now_over = curr_max > temp_thresh;
+        if now_over && !was_over {
+            events.push(
+                GatewayEvent::new(
+                    EventSeverity::Minor,
+                    "sfp",
+                    format!(
+                        "SFP cage temperature on slot {slot} exceeded {temp_thresh:.0} °C (current max {curr_max:.1} °C)"
+                    ),
+                )
+                .with_details(json!({
+                    "slot": slot,
+                    "temp_c_max": curr_max,
+                    "threshold_c": temp_thresh,
+                    "error_code": "sfp_high_temperature",
+                })),
+            );
+        } else if !now_over && was_over {
+            events.push(
+                GatewayEvent::info(
+                    "sfp",
+                    format!("SFP cage temperature recovered on slot {slot} (current max {curr_max:.1} °C)"),
+                )
+                .with_details(json!({ "slot": slot, "temp_c_max": curr_max })),
+            );
+        }
+    }
+
+    events
+}
+
+fn ptp_state_of(status: &Value) -> Option<String> {
+    let pl = status.get("ptpLock")?;
+    if pl.is_object() && pl.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    pl.get("state")
+        .or_else(|| pl.pointer("/value/state"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn min_rx_dbm(status: &Value) -> Option<f64> {
+    let mut m: Option<f64> = None;
+    let qsfp = status.pointer("/qsfpStatus/value").and_then(|v| v.as_array());
+    let sfp = status.pointer("/sfpStatus/value").and_then(|v| v.as_array());
+    for arr in [qsfp, sfp].into_iter().flatten() {
+        for entry in arr {
+            if let Some(rx) = entry.pointer("/value/diagnostics/value/rxPwr").and_then(|v| v.as_array()) {
+                for x in rx {
+                    if let Some(mw) = x.as_f64() {
+                        if mw > 0.0 {
+                            let dbm = 10.0 * mw.log10();
+                            m = Some(match m { Some(v) => v.min(dbm), None => dbm });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+fn max_temp(status: &Value) -> Option<f64> {
+    let mut m: Option<f64> = None;
+    let qsfp = status.pointer("/qsfpStatus/value").and_then(|v| v.as_array());
+    let sfp = status.pointer("/sfpStatus/value").and_then(|v| v.as_array());
+    for arr in [qsfp, sfp].into_iter().flatten() {
+        for entry in arr {
+            if let Some(t) = entry.pointer("/value/diagnostics/value/temp").and_then(|v| v.as_f64()) {
+                m = Some(match m { Some(v) => v.max(t), None => t });
+            }
+        }
+    }
+    m
+}
+
 /// Route an event through the client-side [`EventGate`] before
 /// handing it to the SDK emitter. On suppression, we still forward
 /// the optional summary the gate produced so the operator sees
@@ -360,16 +827,10 @@ async fn emit_gated_event(emitter: &Emitter, gate: &Arc<EventGate>, event: Gatew
             let _ = emitter.emit_event(event).await;
         }
         GateDecision::SendWithRollover { summary } => {
-            // Rollover summary for the prior window first, then the
-            // current event — ordering preserves what the operator
-            // sees in the event log.
             let _ = emitter.emit_event(summary).await;
             let _ = emitter.emit_event(event).await;
         }
         GateDecision::Suppress { summary } => {
-            // Drop the original — manager's own 1000/min limit
-            // would catch it anyway and drop silently, so
-            // dropping here loses no information.
             if let Some(s) = summary {
                 let _ = emitter.emit_event(s).await;
             }

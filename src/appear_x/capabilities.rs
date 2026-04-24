@@ -59,15 +59,45 @@ pub struct SlotCapabilities {
     /// Feature flags reported for this card (e.g. `["sdi-hybrid", "ted",
     /// "encoder", "decoder", "ipinput", "ipoutput", "mmi", "srt"]`).
     pub features: Vec<String>,
-    /// Interfaces successfully discovered on this slot. Keyed by interface
-    /// name; the value is the version that responded plus the canonical
-    /// `<iface>:<ver>/<module>/<command>` string used during the probe.
-    pub discovered_interfaces: BTreeMap<String, DiscoveredInterfaceRecord>,
+    /// Modules successfully discovered on this slot. Keyed by
+    /// `"{interface}/{module}"` (the wire key) — the same key the polling
+    /// engine and command handler look up by.
+    pub discovered_modules: BTreeMap<String, DiscoveredInterfaceRecord>,
+}
+
+impl SlotCapabilities {
+    /// Does this slot speak the given `<interface>/<module>` pair?
+    pub fn has_module(&self, interface: &str, module: &str) -> bool {
+        self.discovered_modules
+            .contains_key(&format!("{interface}/{module}"))
+    }
+
+    /// Version string for a discovered `<interface>/<module>` pair, if any.
+    pub fn module_version(&self, interface: &str, module: &str) -> Option<&str> {
+        self.discovered_modules
+            .get(&format!("{interface}/{module}"))
+            .map(|r| r.version.as_str())
+    }
+
+    /// Return the version of *any* discovered module under the given
+    /// interface, picking the lexicographically-highest version seen.
+    /// Useful when a command needs "what version of interface `X` do we
+    /// speak" without caring which module answered.
+    pub fn any_interface_version(&self, interface: &str) -> Option<&str> {
+        let prefix = format!("{interface}/");
+        self.discovered_modules
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| v.version.as_str())
+            .max()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredInterfaceRecord {
     pub family: String,
+    pub interface: String,
+    pub module: String,
     pub version: String,
     pub probe_method: String,
 }
@@ -195,7 +225,7 @@ pub async fn discover(
                     software_display_name,
                     software_version,
                     features,
-                    discovered_interfaces: BTreeMap::new(),
+                    discovered_modules: BTreeMap::new(),
                 },
             );
         }
@@ -222,14 +252,18 @@ pub async fn discover(
                 let params = match entry.params {
                     ProbeParams::Empty => json!({}),
                     ProbeParams::EmptyQuery => json!({"query": {}}),
+                    ProbeParams::Slot => json!({"slot": *slot}),
                 };
                 match client.call_board(*slot, &method, params).await {
                     Ok(_) => {
                         debug!("  ✓ slot {} {}", slot, method);
-                        caps.discovered_interfaces.insert(
-                            entry.interface.to_string(),
+                        let key = format!("{}/{}", entry.interface, entry.module);
+                        caps.discovered_modules.insert(
+                            key,
                             DiscoveredInterfaceRecord {
                                 family: entry.family.to_string(),
+                                interface: entry.interface.to_string(),
+                                module: entry.module.to_string(),
                                 version: (*version).to_string(),
                                 probe_method: method,
                             },
@@ -237,18 +271,18 @@ pub async fn discover(
                         break; // stop trying older versions for this entry
                     }
                     Err(e) => {
-                        // Most failures here are "Method not found" which is
-                        // expected — that's how we discover what's missing.
-                        // Log at debug only.
+                        // Most failures here are "Method not found" or "404
+                        // Not Found" (interface not loaded at all) — both are
+                        // expected. Log at debug only.
                         debug!("  ✗ slot {} {}: {}", slot, method, e);
                     }
                 }
             }
         }
         info!(
-            "  Slot {} discovered {} card interface(s)",
+            "  Slot {} discovered {} card module(s)",
             slot,
-            caps.discovered_interfaces.len()
+            caps.discovered_modules.len()
         );
     }
 
@@ -294,17 +328,17 @@ fn extract_software_info(
 impl DeviceCapabilities {
     /// One-line summary suitable for human-facing logs and the probe report.
     pub fn summary(&self) -> String {
-        let total_ifaces: usize = self
+        let total_mods: usize = self
             .slots
             .values()
-            .map(|s| s.discovered_interfaces.len())
+            .map(|s| s.discovered_modules.len())
             .sum();
         format!(
-            "chassis={} mmi:{} slots={} discovered_interfaces={}",
+            "chassis={} mmi:{} slots={} discovered_modules={}",
             self.chassis_type,
             self.cards_mmi_version,
             self.slots.len(),
-            total_ifaces
+            total_mods
         )
     }
 }
