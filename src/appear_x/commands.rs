@@ -24,6 +24,8 @@
 use async_trait::async_trait;
 use bilbycast_gateway_sdk::{CommandError, CommandHandler};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use super::jsonrpc::JsonRpcClient;
@@ -38,6 +40,69 @@ pub struct AppearXCommandHandler {
 impl AppearXCommandHandler {
     pub fn new(client: JsonRpcClient, state: SharedAppearXState) -> Self {
         Self { client, state }
+    }
+}
+
+/// Wrapper handler used during the startup window where the manager WS is up
+/// but Appear X capability discovery hasn't completed yet (chassis powered
+/// down, on the wrong subnet, etc.). The sidecar registers this immediately
+/// so the manager can render the node as Online with `gateway_target.reachable
+/// = false`; once discovery succeeds the real [`AppearXCommandHandler`] is
+/// installed and every command thereafter forwards to it.
+///
+/// While the inner handler is `None`, every command returns a
+/// `discovery_in_progress` `CommandError` so the manager UI can show a
+/// "chassis unreachable" banner instead of a generic timeout.
+pub struct DeferredAppearXHandler {
+    inner: RwLock<Option<Arc<AppearXCommandHandler>>>,
+}
+
+impl DeferredAppearXHandler {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
+    /// Swap the real handler in. Idempotent — second call is a no-op.
+    pub async fn install(&self, handler: Arc<AppearXCommandHandler>) {
+        let mut g = self.inner.write().await;
+        if g.is_none() {
+            *g = Some(handler);
+        }
+    }
+}
+
+impl Default for DeferredAppearXHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl CommandHandler for DeferredAppearXHandler {
+    async fn handle_command(
+        &self,
+        command_id: String,
+        action: Value,
+    ) -> Result<Value, CommandError> {
+        let h = self.inner.read().await.clone();
+        match h {
+            Some(h) => h.handle_command(command_id, action).await,
+            None => Err(CommandError::new(
+                "discovery_in_progress",
+                "Appear X capability discovery has not completed — the chassis may be unreachable. \
+                 Commands will be accepted once the sidecar can talk to the unit.",
+            )),
+        }
+    }
+
+    async fn on_config_request(&self) -> Value {
+        let h = self.inner.read().await.clone();
+        match h {
+            Some(h) => h.on_config_request().await,
+            None => json!({ "discovery_in_progress": true }),
+        }
     }
 }
 

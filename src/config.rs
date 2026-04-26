@@ -53,11 +53,25 @@ pub struct AppearXConfig {
     /// Accept self-signed HTTPS certs on the Appear X unit
     #[serde(default = "default_true")]
     pub accept_self_signed_cert: bool,
+    /// Number of consecutive failed alarm polls before flipping
+    /// `gateway_target.reachable` to `false`. At the default 10 s alarms
+    /// poll cadence, the default 2 = ~20 s detection latency. Lower for
+    /// inline broadcast paths; higher for flaky remote uplinks.
+    #[serde(default = "default_failure_threshold")]
+    pub reachability_failure_threshold: u32,
+    /// Minimum dwell time (seconds) in the new reachability state before
+    /// firing a `target_unreachable` / `target_recovered` event. Defeats
+    /// slow-flap noise on degraded uplinks. Default 60 s.
+    #[serde(default = "default_dwell_secs")]
+    pub reachability_event_dwell_secs: u64,
 }
 
 fn default_true() -> bool {
     true
 }
+
+fn default_failure_threshold() -> u32 { 2 }
+fn default_dwell_secs() -> u64 { 60 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PollingConfig {

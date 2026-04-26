@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "bilbycast-appear-x-api-gateway")]
@@ -72,38 +72,33 @@ async fn main() -> Result<()> {
     // Build the Appear X JSON-RPC client
     let appear_client = appear_x::jsonrpc::JsonRpcClient::new(&cfg.appear_x)?;
 
-    // Discover the chassis type and per-slot card capabilities up front. The
-    // result drives which per-slot polling tasks are spawned, so we never call
-    // methods this firmware doesn't understand.
-    info!("Running Appear X capability discovery…");
-    let cards_mmi_versions = ["2.8", "2.16", "4.1", "1.0"];
-    let caps = match appear_x::capabilities::discover(&appear_client, &cards_mmi_versions).await {
-        Ok(c) => {
-            info!("Capability discovery: {}", c.summary());
-            c
-        }
-        Err(e) => {
-            error!("Capability discovery failed: {e:#}");
-            return Err(e);
-        }
-    };
-
-    // Shared state owned by both the polling engine (writers) and the
-    // command handler (reader, for `get_config` responses).
-    let shared_state = appear_x::state::SharedAppearXState::new(
-        caps.clone(),
-        env!("CARGO_PKG_VERSION"),
-        cfg.appear_x.address.clone(),
-    );
-
-    // Build the SDK gateway client, seeded from persisted credentials when
-    // available. `CredentialStore` handles the 0600 JSON blob for us.
+    // Build the SDK gateway client first, before discovery. Connecting to
+    // the manager up front means an operator standing up a gateway against
+    // a powered-down Appear X still sees their sidecar appear on the
+    // dashboard — with `gateway_target.reachable = false` so the new
+    // two-dot card renders "Sidecar Online / Target Unreachable" instead
+    // of "Sidecar Offline / Target Unknown". The previous startup ordering
+    // (discover-then-connect) made this state unreachable: the sidecar would
+    // sit in its discovery retry loop forever and never say hello.
+    //
+    // The wire-level handler we register is a [`DeferredAppearXHandler`]
+    // wrapper that returns a `discovery_in_progress` `command_ack.error_code`
+    // for any command that arrives before discovery completes; once
+    // discovery succeeds we install the real `AppearXCommandHandler` and
+    // every subsequent command forwards normally.
     let credentials_file = cfg.manager.credentials_file.clone();
     let store = CredentialStore::new(credentials_file.clone());
     let persisted = store.load().with_context(|| {
         format!("Failed to load credentials from {credentials_file}")
     })?;
 
+    // Long SDK heartbeat (5 min). The SDK's default `{status:"ok"}` heartbeat
+    // would otherwise overwrite our rich `gateway_target`-bearing heartbeat
+    // in the manager's `cached_health` every 15 s, and the dashboard would
+    // flicker between Target Unreachable and Target Unknown. Application-
+    // layer heartbeats (this file's discovery loop, then the polling engine)
+    // run on a tighter cadence and carry the right shape — so the SDK
+    // default is redundant, just suppressed by setting it large.
     let mut gateway_cfg = GatewayConfig {
         manager_urls: cfg.manager.urls.clone(),
         device_type: "appear_x".into(),
@@ -113,20 +108,17 @@ async fn main() -> Result<()> {
         registration_token: None,
         accept_self_signed_cert: cfg.manager.accept_self_signed_cert,
         cert_fingerprint: cfg.manager.cert_fingerprint.clone(),
-        heartbeat_interval: std::time::Duration::from_secs(15),
+        heartbeat_interval: std::time::Duration::from_secs(300),
         reconnect_backoff: Default::default(),
     };
     if !persisted.has_credentials() {
         gateway_cfg.registration_token = cfg.manager.registration_token.clone();
     }
 
-    let handler = Arc::new(appear_x::commands::AppearXCommandHandler::new(
-        appear_client.clone(),
-        shared_state.clone(),
-    ));
-
-    let mut client = GatewayClient::connect(gateway_cfg, handler).await?;
+    let deferred_handler = Arc::new(appear_x::commands::DeferredAppearXHandler::new());
+    let mut client = GatewayClient::connect(gateway_cfg, deferred_handler.clone()).await?;
     let shutdown = client.shutdown_token();
+    let emitter = client.emitter();
 
     // Persist credentials after first-time registration.
     let store_cb = store.clone();
@@ -153,22 +145,140 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Spawn the polling engine. It emits stats/health/events directly
-    // through the SDK's Emitter (which feeds the WS write task).
-    let polling_emitter = client.emitter();
-    let polling_cancel = shutdown.clone();
-    let polling_client = appear_client.clone();
-    let polling_cfg = cfg.polling.clone();
-    let polling_caps = caps.clone();
-    let polling_state = shared_state.clone();
+    // Spawn discovery + polling startup in the background. While discovery
+    // retries, this task emits a health heartbeat with
+    // `gateway_target.reachable = false` on every failed attempt so the
+    // manager's two-dot card renders Sidecar Online / Target Unreachable.
+    // Once discovery succeeds we install the real command handler and hand
+    // over to the steady-state polling engine, which then owns reachability
+    // tracking via its own alarm-poll heartbeat.
+    let discovery_client = appear_client.clone();
+    let discovery_cfg_polling = cfg.polling.clone();
+    let discovery_appear_x_cfg = cfg.appear_x.clone();
+    let discovery_target_address = cfg.appear_x.address.clone();
+    let discovery_emitter = emitter.clone();
+    let discovery_handler_slot = deferred_handler.clone();
+    let discovery_cancel = shutdown.clone();
+    // Shared "last classified error" published by the discovery loop and
+    // read by the heartbeat task — keeps the two tasks decoupled so the
+    // heartbeat runs on a steady 10 s cadence regardless of how long each
+    // discovery attempt takes (a 10 s JSON-RPC timeout would otherwise
+    // collapse the heartbeat cadence down to ~15 s and lose the race
+    // against the SDK's 15 s default heartbeat).
+    let discovery_phase = Arc::new(tokio::sync::RwLock::new(Some((
+        0u32,
+        "tcp_refused".to_string(),
+    ))));
+
+    // Heartbeat task: emits `gateway_target.reachable = false` every 10 s
+    // for as long as `discovery_phase` is `Some(...)`. Tighter than the
+    // SDK's 15 s default heartbeat so the rich envelope reliably wins the
+    // overwrite race in the manager's `cached_health`.
+    let hb_emitter = emitter.clone();
+    let hb_phase = discovery_phase.clone();
+    let hb_target_address = cfg.appear_x.address.clone();
+    let hb_cancel = shutdown.clone();
     tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = hb_cancel.cancelled() => return,
+            }
+            let phase = hb_phase.read().await.clone();
+            let Some((failures, error_code)) = phase else {
+                // Discovery succeeded — polling owns the heartbeat now.
+                return;
+            };
+            let target = bilbycast_gateway_sdk::GatewayTargetHealth {
+                reachable: false,
+                target_address: hb_target_address.clone(),
+                gateway_host: appear_x::reachability::detect_hostname(),
+                gateway_egress_ip: appear_x::reachability::detect_egress_ip(),
+                last_successful_poll_unix: None,
+                last_error_code: Some(error_code),
+                consecutive_failures: Some(failures),
+            };
+            let health = serde_json::json!({
+                "status": "critical",
+                "alarms": [],
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            if let Err(e) = hb_emitter.emit_health_with_target(health, target).await {
+                debug!("Failed to emit discovery-phase health: {e}");
+            }
+        }
+    });
+
+    let discovery_phase_for_loop = discovery_phase.clone();
+    tokio::spawn(async move {
+        info!("Running Appear X capability discovery in background…");
+        let cards_mmi_versions = ["2.8", "2.16", "4.1", "1.0"];
+        let retry_delay = std::time::Duration::from_secs(5);
+        let mut attempt: u32 = 0;
+        let caps = loop {
+            match appear_x::capabilities::discover(&discovery_client, &cards_mmi_versions).await {
+                Ok(c) => {
+                    info!("Capability discovery: {}", c.summary());
+                    break c;
+                }
+                Err(e) => {
+                    attempt = attempt.saturating_add(1);
+                    let error_code = appear_x::reachability::classify_jsonrpc_error(&e).to_string();
+                    warn!(
+                        "Capability discovery failed (attempt {attempt}): {e:#}. \
+                         Retrying in {} s",
+                        retry_delay.as_secs()
+                    );
+                    {
+                        let mut g = discovery_phase_for_loop.write().await;
+                        *g = Some((attempt, error_code));
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_delay) => {}
+                        _ = discovery_cancel.cancelled() => {
+                            info!("Shutdown requested during capability discovery");
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        // Discovery succeeded — flip the phase to None so the heartbeat
+        // task exits and the polling engine below takes over.
+        {
+            let mut g = discovery_phase_for_loop.write().await;
+            *g = None;
+        }
+
+        // Build steady-state plumbing now that we know the chassis layout.
+        let shared_state = appear_x::state::SharedAppearXState::new(
+            caps.clone(),
+            env!("CARGO_PKG_VERSION"),
+            discovery_target_address.clone(),
+        );
+        let real_handler = Arc::new(appear_x::commands::AppearXCommandHandler::new(
+            discovery_client.clone(),
+            shared_state.clone(),
+        ));
+        discovery_handler_slot.install(real_handler).await;
+
+        let polling_identity = appear_x::polling::GatewayIdentity {
+            target_address: discovery_target_address,
+            gateway_host: appear_x::reachability::detect_hostname(),
+            failure_threshold: discovery_appear_x_cfg.reachability_failure_threshold,
+            event_dwell_secs: discovery_appear_x_cfg.reachability_event_dwell_secs,
+        };
         if let Err(e) = appear_x::polling::run_polling(
-            polling_client,
-            polling_cfg,
-            polling_caps,
-            polling_state,
-            polling_emitter,
-            polling_cancel,
+            discovery_client,
+            discovery_cfg_polling,
+            caps,
+            shared_state,
+            discovery_emitter,
+            polling_identity,
+            discovery_cancel,
         )
         .await
         {

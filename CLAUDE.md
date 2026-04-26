@@ -110,6 +110,10 @@ Spawns periodic polling tasks per configured board slot:
 
 Health status derivation: `MAJOR`/`CRITICAL` alarms → "critical", `MINOR`/`WARNING` → "degraded", no alarms → "ok".
 
+**Target reachability sub-status (`gateway_target`).** Every health heartbeat also carries a typed `gateway_target` block (via the SDK's `Emitter::emit_health_with_target`) with `{reachable, target_address, gateway_host, gateway_egress_ip, last_successful_poll_unix, last_error_code, consecutive_failures}`. The alarms poller is the natural reachability heartbeat — its outcome (success / failure) drives `ReachabilityState` (`src/appear_x/reachability.rs`). When `consecutive_failures` crosses `[appear_x] reachability_failure_threshold` (default 2), `reachable` flips to `false` and the manager's dashboard renders the third "Target down" amber state. The polled chassis address comes from `[appear_x] address`; the gateway's own host / egress IP are detected at startup (via `/proc/sys/kernel/hostname` and a UDP-egress probe respectively). `last_error_code` is a fixed enum (`http_timeout` | `tcp_refused` | `tls_handshake` | `auth_rejected` | `rpc_protocol_error` | `other`) — verbose vendor errors stay in this gateway's local logs, never on the wire.
+
+**Reachability events (`category: target_reachability`).** Edge-triggered, dwell-gated transitions fire two events: `target_unreachable` (Critical) when the chassis becomes unreachable AND the new state has been stable past `reachability_event_dwell_secs` (default 60 s — defeats slow-flap noise on degraded uplinks); `target_recovered` (Info) on the first success after a sustained unreachable streak. Single-fire per flip — flapping uplinks don't spam events.
+
 ### Command Handler (`appear_x/commands.rs`)
 
 Translates manager commands into Appear X JSON-RPC calls:
@@ -153,6 +157,8 @@ TOML config file. See `config/example.toml` for a complete template.
 | `appear_x.username` | Yes | — | JSON-RPC login username |
 | `appear_x.password` | Yes | — | JSON-RPC login password |
 | `appear_x.accept_self_signed_cert` | No | `true` | Accept Appear X self-signed HTTPS certs |
+| `appear_x.reachability_failure_threshold` | No | `2` | Consecutive failed alarm polls before flipping `gateway_target.reachable` to `false` |
+| `appear_x.reachability_event_dwell_secs` | No | `60` | Minimum dwell time (seconds) in the new reachability state before firing a `target_unreachable` / `target_recovered` event |
 
 ## Environment Variables
 

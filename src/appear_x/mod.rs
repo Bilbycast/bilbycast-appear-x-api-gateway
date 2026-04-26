@@ -6,4 +6,5 @@ pub mod commands;
 pub mod jsonrpc;
 pub mod polling;
 pub mod probe_registry;
+pub mod reachability;
 pub mod state;

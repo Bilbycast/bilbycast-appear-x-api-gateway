@@ -19,7 +19,7 @@
 //! on the edge, so steady-state alerts do not flood the manager.
 
 use anyhow::Result;
-use bilbycast_gateway_sdk::{Emitter, EventSeverity, GatewayEvent};
+use bilbycast_gateway_sdk::{Emitter, EventSeverity, GatewayEvent, GatewayTargetHealth};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,9 +28,28 @@ use tracing::{debug, error, info, warn};
 
 use super::capabilities::DeviceCapabilities;
 use super::jsonrpc::JsonRpcClient;
+use super::reachability::{
+    classify_jsonrpc_error, detect_egress_ip, ReachabilityState, TransitionOutcome,
+};
 use super::state::SharedAppearXState;
 use crate::config::PollingConfig;
 use crate::event_gate::{EventGate, GateDecision};
+
+/// Static identity of the gateway sidecar. Built once from the operator's
+/// TOML config plus a hostname probe at startup, then threaded into the
+/// alarms poller so every health heartbeat carries the gateway's own
+/// host / target / reachability metadata.
+#[derive(Debug, Clone)]
+pub struct GatewayIdentity {
+    /// IP / hostname of the Appear X chassis we're polling.
+    pub target_address: String,
+    /// Sidecar's own hostname (best-effort, may be `None`).
+    pub gateway_host: Option<String>,
+    /// Threshold (consecutive failed polls) before flipping reachable=false.
+    pub failure_threshold: u32,
+    /// Dwell time (seconds) before a state flip fires a `target_*` event.
+    pub event_dwell_secs: u64,
+}
 
 /// Interval (seconds) at which the consolidated stats snapshot is pushed to
 /// the manager. Independent of the per-source polling cadences.
@@ -50,6 +69,7 @@ pub async fn run_polling(
     caps: DeviceCapabilities,
     state: SharedAppearXState,
     emitter: Emitter,
+    identity: GatewayIdentity,
     cancel: CancellationToken,
 ) -> Result<()> {
     // Authenticate once at startup
@@ -65,7 +85,7 @@ pub async fn run_polling(
     // this lives locally. See `event_gate.rs` for the full rationale.
     let event_gate = Arc::new(EventGate::new());
 
-    spawn_alarms_poller(&client, &config, &state, &emitter, &event_gate, &cancel);
+    spawn_alarms_poller(&client, &config, &state, &emitter, &event_gate, &identity, &cancel);
     spawn_chassis_poller(&client, &config, &state, &cancel);
     spawn_cards_poller(&client, &config, &state, &cancel);
 
@@ -414,18 +434,26 @@ pub async fn run_polling(
 }
 
 /// Spawn the `cardStatus` independent "alarms" poller that also emits a
-/// `health` envelope on every tick.
+/// `health` envelope (with the `gateway_target` sub-status) on every tick
+/// — both when the poll succeeds AND when it fails. Failure path is what
+/// drives the manager-side dashboard's third "Target down" amber state.
 fn spawn_alarms_poller(
     client: &JsonRpcClient,
     config: &PollingConfig,
     state: &SharedAppearXState,
     emitter: &Emitter,
     event_gate: &Arc<EventGate>,
+    identity: &GatewayIdentity,
     cancel: &CancellationToken,
 ) {
     let alarms_method = format!("mmi:{}/alarms/GetActiveAlarms", config.alarms_mmi_version);
     let emitter = emitter.clone();
     let event_gate = event_gate.clone();
+    let identity = identity.clone();
+    let reachability = Arc::new(ReachabilityState::new(
+        identity.failure_threshold,
+        identity.event_dwell_secs,
+    ));
     spawn_state_poll(
         client.clone(),
         state.clone(),
@@ -436,94 +464,182 @@ fn spawn_alarms_poller(
             let alarms_method = alarms_method.clone();
             let emitter = emitter.clone();
             let event_gate = event_gate.clone();
+            let identity = identity.clone();
+            let reachability = reachability.clone();
             Box::pin(async move {
-                let result = c.call_mmi(&alarms_method, json!({"query": {}})).await?;
-                let alarms_value = result.get("data").cloned().unwrap_or(json!([]));
-                let alarm_list: Vec<Value> =
-                    alarms_value.as_array().cloned().unwrap_or_default();
+                // Capture the JSON-RPC outcome explicitly — we need to emit
+                // a health heartbeat in BOTH the success and failure paths
+                // so the manager's dashboard can render the third
+                // "Target down" state when the chassis is unreachable.
+                let call_outcome = c.call_mmi(&alarms_method, json!({"query": {}})).await;
 
-                let status = derive_status(&alarm_list);
-                let (new_alarms, cleared_ids) = st.set_alarms(alarm_list, status).await;
+                // Status used in the existing health field — derived from
+                // alarm severity on success; "critical" on failure (no
+                // alarm visibility = treat as critical for the status
+                // string, separate from gateway_target.reachable).
+                let (status, alarms_value): (&'static str, Value) = match &call_outcome {
+                    Ok(result) => {
+                        let alarms_value = result.get("data").cloned().unwrap_or(json!([]));
+                        let alarm_list: Vec<Value> =
+                            alarms_value.as_array().cloned().unwrap_or_default();
+                        let status = derive_status(&alarm_list);
+                        let (new_alarms, cleared_ids) =
+                            st.set_alarms(alarm_list, status).await;
 
-                for alarm in &new_alarms {
-                    let severity = alarm
-                        .get("severity")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("UNKNOWN");
-                    let alarm_id = alarm
-                        .get("alarmId")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    let alarm_name = alarm
-                        .get("alarmName")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let description = alarm
-                        .get("alarmDescription")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let slot = alarm
-                        .get("configObjectSlot")
-                        .and_then(|s| s.as_u64());
-                    let object_label = alarm
-                        .get("configObjectLabel")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let object_type = alarm
-                        .get("configObjectType")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let object_id = alarm
-                        .get("configObjectId")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let event_severity = match severity {
-                        "CRITICAL" | "MAJOR" => EventSeverity::Critical,
-                        "MINOR" | "WARNING" => EventSeverity::Minor,
-                        _ => EventSeverity::Info,
-                    };
-                    let message = if alarm_name.is_empty() {
-                        format!("Alarm raised: {description}")
-                    } else {
-                        format!("Alarm raised: {alarm_name} — {description}")
-                    };
-                    let mut details = json!({
-                        "alarm_id": alarm_id,
-                        "severity": severity,
-                    });
-                    if let Some(s) = slot {
-                        details["slot"] = json!(s);
+                        for alarm in &new_alarms {
+                            let severity = alarm
+                                .get("severity")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("UNKNOWN");
+                            let alarm_id = alarm
+                                .get("alarmId")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            let alarm_name = alarm
+                                .get("alarmName")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let description = alarm
+                                .get("alarmDescription")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let slot = alarm
+                                .get("configObjectSlot")
+                                .and_then(|s| s.as_u64());
+                            let object_label = alarm
+                                .get("configObjectLabel")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let object_type = alarm
+                                .get("configObjectType")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let object_id = alarm
+                                .get("configObjectId")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            let event_severity = match severity {
+                                "CRITICAL" | "MAJOR" => EventSeverity::Critical,
+                                "MINOR" | "WARNING" => EventSeverity::Minor,
+                                _ => EventSeverity::Info,
+                            };
+                            let message = if alarm_name.is_empty() {
+                                format!("Alarm raised: {description}")
+                            } else {
+                                format!("Alarm raised: {alarm_name} — {description}")
+                            };
+                            let mut details = json!({
+                                "alarm_id": alarm_id,
+                                "severity": severity,
+                            });
+                            if let Some(s) = slot {
+                                details["slot"] = json!(s);
+                            }
+                            if !object_label.is_empty() {
+                                details["object_label"] = json!(object_label);
+                            }
+                            if !object_type.is_empty() {
+                                details["object_type"] = json!(object_type);
+                            }
+                            if !object_id.is_empty() {
+                                details["object_id"] = json!(object_id);
+                            }
+                            let event = GatewayEvent::new(event_severity, "alarm", message)
+                                .with_details(details);
+                            emit_gated_event(&emitter, &event_gate, event).await;
+                        }
+
+                        for alarm_id in &cleared_ids {
+                            let event = GatewayEvent::info(
+                                "alarm",
+                                format!("Alarm cleared: {alarm_id}"),
+                            )
+                            .with_details(json!({ "alarm_id": alarm_id }));
+                            emit_gated_event(&emitter, &event_gate, event).await;
+                        }
+                        (status, alarms_value)
                     }
-                    if !object_label.is_empty() {
-                        details["object_label"] = json!(object_label);
+                    Err(e) => {
+                        // Verbose vendor error stays in the local log only —
+                        // never on the wire (could quote URLs / credentials).
+                        warn!(error = %e, "appear_x alarms poll failed");
+                        ("critical", json!([]))
                     }
-                    if !object_type.is_empty() {
-                        details["object_type"] = json!(object_type);
+                };
+
+                // Update reachability state based on outcome and decide
+                // whether to fire a target_reachability event.
+                let transition = match &call_outcome {
+                    Ok(_) => reachability.record_success(),
+                    Err(e) => {
+                        let code = classify_jsonrpc_error(e);
+                        reachability.record_failure(code)
                     }
-                    if !object_id.is_empty() {
-                        details["object_id"] = json!(object_id);
-                    }
-                    let event = GatewayEvent::new(event_severity, "alarm", message)
+                };
+                match transition {
+                    TransitionOutcome::BecameUnreachable {
+                        consecutive_failures,
+                        last_error_code,
+                    } => {
+                        let mut details = json!({
+                            "error_code": "target_unreachable",
+                            "consecutive_failures": consecutive_failures,
+                            "target_address": identity.target_address,
+                        });
+                        if let Some(code) = last_error_code {
+                            details["last_error_code"] = json!(code);
+                        }
+                        let event = GatewayEvent::new(
+                            EventSeverity::Critical,
+                            "target_reachability",
+                            format!(
+                                "Target Appear X at {} unreachable",
+                                identity.target_address
+                            ),
+                        )
                         .with_details(details);
-                    emit_gated_event(&emitter, &event_gate, event).await;
+                        emit_gated_event(&emitter, &event_gate, event).await;
+                    }
+                    TransitionOutcome::Recovered { downtime_secs } => {
+                        let event = GatewayEvent::info(
+                            "target_reachability",
+                            format!(
+                                "Target Appear X at {} reachable again (downtime {} s)",
+                                identity.target_address, downtime_secs
+                            ),
+                        )
+                        .with_details(json!({
+                            "error_code": "target_recovered",
+                            "downtime_secs": downtime_secs,
+                            "target_address": identity.target_address,
+                        }));
+                        emit_gated_event(&emitter, &event_gate, event).await;
+                    }
+                    TransitionOutcome::NoChange => {}
                 }
 
-                for alarm_id in &cleared_ids {
-                    let event = GatewayEvent::info(
-                        "alarm",
-                        format!("Alarm cleared: {alarm_id}"),
-                    )
-                    .with_details(json!({ "alarm_id": alarm_id }));
-                    emit_gated_event(&emitter, &event_gate, event).await;
-                }
-
+                // Build the gateway_target sub-status and emit the health
+                // heartbeat unconditionally — both success and failure
+                // paths reach here.
+                let target = GatewayTargetHealth {
+                    reachable: reachability.is_reachable(),
+                    target_address: identity.target_address.clone(),
+                    gateway_host: identity.gateway_host.clone(),
+                    gateway_egress_ip: detect_egress_ip(),
+                    last_successful_poll_unix: reachability.last_success_unix(),
+                    last_error_code: reachability.last_error_code(),
+                    consecutive_failures: Some(reachability.consecutive_failures()),
+                };
                 let health = json!({
                     "status": status,
                     "alarms": alarms_value,
                     "version": env!("CARGO_PKG_VERSION"),
                 });
-                let _ = emitter.emit_health(health).await;
-                Ok(())
+                let _ = emitter.emit_health_with_target(health, target).await;
+
+                // Surface the original error to spawn_state_poll's logger
+                // on failure paths so we keep the existing observability.
+                call_outcome.map(|_| ())
             })
         },
     );
