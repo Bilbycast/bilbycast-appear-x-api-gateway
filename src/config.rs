@@ -50,9 +50,22 @@ pub struct AppearXConfig {
     pub username: String,
     /// Login password
     pub password: String,
-    /// Accept self-signed HTTPS certs on the Appear X unit
+    /// Accept self-signed HTTPS certs on the Appear X unit. Defaults to
+    /// `true` because Appear X chassis ship with self-signed certs out
+    /// of the box. Production deployments that want stricter posture
+    /// should pin the certificate via `cert_fingerprint` (which still
+    /// runs full CA-chain validation) rather than disabling this flag.
     #[serde(default = "default_true")]
     pub accept_self_signed_cert: bool,
+    /// Optional SHA-256 certificate fingerprint pin for the Appear X
+    /// unit's HTTPS endpoint (colon-separated lowercase hex, or bare
+    /// hex — both forms accepted, normalised at load time). When set,
+    /// full CA-chain validation runs **and** the leaf cert's
+    /// fingerprint must match. Defends against compromised CAs and
+    /// MITM in transit between gateway and chassis. Independent of
+    /// `accept_self_signed_cert` — pinning takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
     /// Number of consecutive failed alarm polls before flipping
     /// `gateway_target.reachable` to `false`. At the default 10 s alarms
     /// poll cadence, the default 2 = ~20 s detection latency. Lower for
@@ -179,6 +192,13 @@ impl AppConfig {
         }
         if config.appear_x.address.is_empty() {
             anyhow::bail!("Appear X address must not be empty");
+        }
+        if let Some(ref fp) = config.appear_x.cert_fingerprint {
+            // Validate format — accepts both colon-separated and bare hex.
+            // Reuses the same fingerprint normaliser the SDK uses for the
+            // manager-side pin so the formats stay symmetric.
+            bilbycast_gateway_sdk::tls::normalise_fingerprint(fp)
+                .map_err(|e| anyhow::anyhow!("appear_x.cert_fingerprint: {}", e))?;
         }
 
         Ok(config)

@@ -25,10 +25,40 @@ pub struct JsonRpcClient {
 
 impl JsonRpcClient {
     pub fn new(config: &AppearXConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(config.accept_self_signed_cert)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        // TLS posture for the Appear X HTTPS endpoint. Three modes:
+        //
+        // 1. `cert_fingerprint` set → full CA-chain validation **and**
+        //    leaf-cert SHA-256 must match the configured pin. This is
+        //    the strongest mode and is the recommended posture for
+        //    production deployments.
+        // 2. `accept_self_signed_cert: true` (the default) → no TLS
+        //    validation. Appear X chassis ship with self-signed certs
+        //    out of the box and customer test rigs depend on this
+        //    permissive default. Pin via #1 to upgrade.
+        // 3. `accept_self_signed_cert: false` and no fingerprint →
+        //    standard CA-chain validation against the system roots.
+        let builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10));
+        let builder = if let Some(ref fp) = config.cert_fingerprint {
+            // The SDK's pinning path doesn't enforce the
+            // BILBYCAST_ALLOW_INSECURE env var (the env-var guard is
+            // only on the unconditional self-signed path). Pinning
+            // gives stronger guarantees than self-signed acceptance
+            // and is safe to enable without the guard.
+            let tls_config = bilbycast_gateway_sdk::tls::build_tls_config(false, Some(fp))
+                .map_err(|e| anyhow::anyhow!("Appear X TLS config: {e}"))?;
+            tracing::info!(
+                "Appear X TLS: certificate pinning enabled (fingerprint prefix: {}...)",
+                &fp.chars().take(11).collect::<String>()
+            );
+            builder.use_preconfigured_tls(tls_config)
+        } else {
+            // Preserve historical behaviour exactly when no pin is
+            // configured. `accept_self_signed_cert: true` (the default)
+            // remains permissive without requiring an env var.
+            builder.danger_accept_invalid_certs(config.accept_self_signed_cert)
+        };
+        let http = builder.build()?;
 
         Ok(Self {
             http,
