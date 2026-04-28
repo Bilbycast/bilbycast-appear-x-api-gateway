@@ -30,16 +30,37 @@ use tracing::{debug, info};
 
 use super::jsonrpc::JsonRpcClient;
 use super::state::SharedAppearXState;
+use crate::config::PollingConfig;
+
+/// MMI interface versions used by on-demand command calls. Threaded in from
+/// [`PollingConfig`] so the command path uses the same firmware-specific
+/// versions as the polling path (different Appear firmware exposes
+/// `chassisModel` at 2.16, 4.1, etc. — see polling.rs).
+#[derive(Debug, Clone)]
+pub struct MmiVersions {
+    pub alarms: String,
+    pub chassis: String,
+}
+
+impl From<&PollingConfig> for MmiVersions {
+    fn from(p: &PollingConfig) -> Self {
+        Self {
+            alarms: p.alarms_mmi_version.clone(),
+            chassis: p.chassis_mmi_version.clone(),
+        }
+    }
+}
 
 /// Vendor-side command handler, wired up to the SDK via [`CommandHandler`].
 pub struct AppearXCommandHandler {
     client: JsonRpcClient,
     state: SharedAppearXState,
+    mmi: MmiVersions,
 }
 
 impl AppearXCommandHandler {
-    pub fn new(client: JsonRpcClient, state: SharedAppearXState) -> Self {
-        Self { client, state }
+    pub fn new(client: JsonRpcClient, state: SharedAppearXState, mmi: MmiVersions) -> Self {
+        Self { client, state, mmi }
     }
 }
 
@@ -220,17 +241,25 @@ impl CommandHandler for AppearXCommandHandler {
             }
 
             // ── MMI cross-card family ──
+            //
+            // MMI interface versions vary by firmware (`chassisModel` is 2.16
+            // on older units, 4.1 on current X5/X10 firmware; alarms is 2.8
+            // or 2.16). Use the operator-supplied versions threaded in from
+            // PollingConfig so the command path matches what polling uses.
             "get_alarms" => self
                 .client
                 .call_mmi(
-                    "mmi:2.16/alarms/GetActiveAlarms",
+                    &format!("mmi:{}/alarms/GetActiveAlarms", self.mmi.alarms),
                     json!({"query": {}}),
                 )
                 .await
                 .map_err(vendor_error),
             "get_chassis" => self
                 .client
-                .call_mmi("mmi:2.16/chassisModel/GetGraph", json!({}))
+                .call_mmi(
+                    &format!("mmi:{}/chassisModel/GetGraph", self.mmi.chassis),
+                    json!({}),
+                )
                 .await
                 .map_err(vendor_error),
 
@@ -424,6 +453,128 @@ impl CommandHandler for AppearXCommandHandler {
                 "pool_config",
             )
             .await,
+
+            // Phase 2: ipConnection (UDP / RTP / SRT / RIST transport bindings).
+            "get_ip_connections" => xger_call(
+                &self.client,
+                &self.state,
+                slot,
+                "ipConnection",
+                "GetIpConnections",
+                json!({}),
+            )
+            .await,
+            "set_ip_connections" => xger_set(
+                &self.client,
+                &self.state,
+                slot,
+                "ipConnection",
+                "SetIpConnections",
+                &action,
+                "ip_connections",
+            )
+            .await,
+            "delete_ip_connections" => xger_delete(
+                &self.client,
+                &self.state,
+                slot,
+                "ipConnection",
+                "DeleteIpConnections",
+                &action,
+            )
+            .await,
+
+            // Phase 2: redundancyGroup (ST 2022-7 / hot-standby).
+            "get_redundancy_groups" => xger_call(
+                &self.client,
+                &self.state,
+                slot,
+                "redundancyGroup",
+                "GetRedundancyGroups",
+                json!({}),
+            )
+            .await,
+            "set_redundancy_groups" => xger_set(
+                &self.client,
+                &self.state,
+                slot,
+                "redundancyGroup",
+                "SetRedundancyGroups",
+                &action,
+                "redundancy_groups",
+            )
+            .await,
+            "delete_redundancy_groups" => xger_delete(
+                &self.client,
+                &self.state,
+                slot,
+                "redundancyGroup",
+                "DeleteRedundancyGroups",
+                &action,
+            )
+            .await,
+            "get_redundancy_group_status" => xger_call(
+                &self.client,
+                &self.state,
+                slot,
+                "redundancyGroupStatus",
+                "GetRedundancyGroupStatus",
+                json!({}),
+            )
+            .await,
+
+            // ── Phase 3a: per-encoder / per-decoder runtime config ──
+            //
+            // Get/Set on `hip*Encoder` / `hip*Decoder` modules. Each
+            // command auto-routes on the slot's discovered family — JPEG-XS
+            // (`hipEnc` / `hipDec`) vs HEVC-TS (`hipTsEnc` / `hipTsDec`) —
+            // mirroring the existing `clear_all_counters` selector pattern.
+            // Operator pastes a Get response, edits, sends Set. The vendor
+            // body shape varies by firmware; pass-through JSON.
+            "get_hip_encoders" => hip_call(&self.client, &self.state, slot,
+                /*encoder=*/true, /*set=*/false, &action).await,
+            "set_hip_encoders" => hip_call(&self.client, &self.state, slot,
+                /*encoder=*/true, /*set=*/true, &action).await,
+            "get_hip_decoders" => hip_call(&self.client, &self.state, slot,
+                /*encoder=*/false, /*set=*/false, &action).await,
+            "set_hip_decoders" => hip_call(&self.client, &self.state, slot,
+                /*encoder=*/false, /*set=*/true, &action).await,
+
+            // ── Phase 3b: SCTE-35 / DPI / ESAM ──
+            //
+            // Symmetrical Get/Set on each module (Xger surface). The
+            // splice-history fetch is on-demand only — never polled, since
+            // the log can be large.
+            "get_dpi" => xger_call(&self.client, &self.state, slot,
+                "dpi", "GetDpi", json!({})).await,
+            "set_dpi" => xger_set_raw(&self.client, &self.state, slot,
+                "dpi", "SetDpi", &action, "dpi").await,
+            "get_dpi_status" => xger_call(&self.client, &self.state, slot,
+                "dpiStatus", "GetDpiStatus", json!({})).await,
+            "get_esam_config" => xger_call(&self.client, &self.state, slot,
+                "esamConfig", "GetEsamConfig", json!({})).await,
+            "set_esam_config" => xger_set_raw(&self.client, &self.state, slot,
+                "esamConfig", "SetEsamConfig", &action, "esam_config").await,
+            "get_esam_status" => xger_call(&self.client, &self.state, slot,
+                "esamStatus", "GetEsamStatus", json!({})).await,
+            "get_scte35_config" => xger_call(&self.client, &self.state, slot,
+                "scte35Config", "GetScte35Config", json!({})).await,
+            "set_scte35_config" => xger_set_raw(&self.client, &self.state, slot,
+                "scte35Config", "SetScte35Config", &action, "scte35_config").await,
+            "get_scte35_history" => {
+                // On-demand fetch from the splice log API. Optional `limit`
+                // / `since_pts` params get forwarded if present.
+                let mut params = json!({});
+                if let Some(p) = action.as_object() {
+                    if let Some(l) = p.get("limit") { params["limit"] = l.clone(); }
+                    if let Some(s) = p.get("since_pts") { params["since_pts"] = s.clone(); }
+                }
+                xger_call(&self.client, &self.state, slot,
+                    "scte35LogApi", "GetScte35History", params).await
+            },
+            "get_pois_server_status" => xger_call(&self.client, &self.state, slot,
+                "poisServerStatus", "GetPoisServerStatus", json!({})).await,
+
             "clear_all_counters" => {
                 // Reset packet / sequence error counters on the encoder. The
                 // Appear X API exposes `ClearAllCounters` on the
@@ -511,19 +662,27 @@ fn unsupported_on_card(slot: u32, action: &str, iface_module: &str) -> CommandEr
     )
 }
 
-/// Resolve the Xger interface version for a specific module. Falls back to
-/// any discovered Xger module's version, then "2.55".
-fn xger_version(state: &SharedAppearXState, slot: u32, module: &str) -> String {
-    if let Some(v) = state.discovered_version(slot, "Xger", module) {
-        return v;
-    }
-    if let Some(v) = state.any_interface_version(slot, "Xger") {
-        return v;
-    }
-    "2.55".to_string()
+/// Resolve the Xger interface version for a specific module. Strict — if
+/// the probe registry didn't discover this module on the slot, return an
+/// `unsupported_on_card` error rather than letting the call go to the unit
+/// and surfacing a raw "Method not found" RPC error to the operator.
+///
+/// Symmetric with [`require_ipgw`] for the legacy IP Gateway surface: every
+/// command path is gated on the same discovery state the polling layer uses.
+fn xger_version(
+    state: &SharedAppearXState,
+    slot: u32,
+    module: &str,
+    action_name: &str,
+) -> Result<String, CommandError> {
+    state
+        .discovered_version(slot, "Xger", module)
+        .ok_or_else(|| unsupported_on_card(slot, action_name, &format!("Xger/{module}")))
 }
 
-/// Issue a plain Xger Get call and return the raw JSON-RPC result.
+/// Issue a plain Xger Get call and return the raw JSON-RPC result. Gated on
+/// per-slot capability discovery: the call never leaves the gateway if the
+/// probe registry didn't find this module on the slot.
 async fn xger_call(
     client: &JsonRpcClient,
     state: &SharedAppearXState,
@@ -532,7 +691,8 @@ async fn xger_call(
     command: &str,
     params: Value,
 ) -> Result<Value, CommandError> {
-    let ver = xger_version(state, slot, module);
+    let action_name = command_to_action(command);
+    let ver = xger_version(state, slot, module, &action_name)?;
     client
         .call_board(slot, &format!("Xger:{ver}/{module}/{command}"), params)
         .await
@@ -550,7 +710,8 @@ async fn xger_set(
     action: &Value,
     payload_key: &str,
 ) -> Result<Value, CommandError> {
-    let ver = xger_version(state, slot, module);
+    let action_name = command_to_action(command);
+    let ver = xger_version(state, slot, module, &action_name)?;
     let data = action.get(payload_key).cloned().ok_or_else(|| {
         CommandError::validation(format!("missing '{payload_key}' field").as_str())
     })?;
@@ -580,7 +741,8 @@ async fn xger_set_raw(
     action: &Value,
     payload_key: &str,
 ) -> Result<Value, CommandError> {
-    let ver = xger_version(state, slot, module);
+    let action_name = command_to_action(command);
+    let ver = xger_version(state, slot, module, &action_name)?;
     let data = action.get(payload_key).cloned().ok_or_else(|| {
         CommandError::validation(format!("missing '{payload_key}' field").as_str())
     })?;
@@ -594,6 +756,88 @@ async fn xger_set_raw(
         .map_err(vendor_error)
 }
 
+/// Convert a vendor command verb (e.g. `GetCoderServices`, `SetAudioProfiles`)
+/// into the snake_case action name an operator would type at the manager
+/// (`get_coder_services`). Used purely to make the `unsupported_on_card`
+/// message match what they sent.
+fn command_to_action(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 4);
+    for (i, ch) in command.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Phase 3a: per-encoder / per-decoder Get/Set router. Routes on the slot's
+/// discovered family (`hipEnc` JPEG-XS vs `hipTsEnc` HEVC-TS for the encoder
+/// side; `hipDec` vs `hipTsDec` for the decoder side). Mirrors the selector
+/// logic used by `clear_all_counters`. Returns `unsupported_on_card` when no
+/// encoder/decoder family is on the slot.
+///
+/// For Set, the operator's payload lives at `action.config` and is sent
+/// pass-through as `{"data": <config>}` — schema varies by firmware.
+async fn hip_call(
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    slot: u32,
+    encoder: bool,
+    set: bool,
+    action: &Value,
+) -> Result<Value, CommandError> {
+    let candidates: &[(&str, &str)] = if encoder {
+        &[("hipTsEnc", "hipTsEncoder"), ("hipEnc", "hipEncoder")]
+    } else {
+        &[("hipTsDec", "hipTsDecoder"), ("hipDec", "hipDecoder")]
+    };
+    let mut chosen: Option<(&str, &str, String)> = None;
+    for (iface, module) in candidates {
+        if let Some(v) = state.discovered_version(slot, iface, module) {
+            chosen = Some((iface, module, v));
+            break;
+        }
+    }
+    let (iface, module, ver) = chosen.ok_or_else(|| {
+        CommandError::new(
+            "unsupported_on_card",
+            format!(
+                "Slot {slot} exposes no {kind} module ({fam}). Commission an {kind} pool first.",
+                kind = if encoder { "encoder" } else { "decoder" },
+                fam = candidates.iter().map(|(i, _)| *i).collect::<Vec<_>>().join(" / "),
+            ),
+        )
+    })?;
+    let cmd = if set {
+        if encoder {
+            "SetEncoders"
+        } else {
+            "SetDecoders"
+        }
+    } else if encoder {
+        "GetEncoders"
+    } else {
+        "GetDecoders"
+    };
+    let params = if set {
+        let cfg = action.get("config").cloned().ok_or_else(|| {
+            CommandError::validation("missing 'config' field for set command")
+        })?;
+        json!({ "data": cfg })
+    } else {
+        json!({})
+    };
+    client
+        .call_board(slot, &format!("{iface}:{ver}/{module}/{cmd}"), params)
+        .await
+        .map_err(vendor_error)
+}
+
 /// Issue an Xger Delete command with an `ids: [UUID, …]` body.
 async fn xger_delete(
     client: &JsonRpcClient,
@@ -603,7 +847,8 @@ async fn xger_delete(
     command: &str,
     action: &Value,
 ) -> Result<Value, CommandError> {
-    let ver = xger_version(state, slot, module);
+    let action_name = command_to_action(command);
+    let ver = xger_version(state, slot, module, &action_name)?;
     let ids = action
         .get("ids")
         .cloned()

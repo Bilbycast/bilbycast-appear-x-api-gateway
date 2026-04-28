@@ -314,6 +314,144 @@ pub async fn run_polling(
             },
         );
 
+        // Phase 2: ipConnection (UDP / RTP / SRT / RIST transport bindings).
+        // Only present on commissioned units that load the `Xger:*/ipConnection`
+        // module — bare X5 HEVC SDI doesn't, and `spawn_xger_slow` no-ops if
+        // the module wasn't discovered.
+        spawn_xger_slow(
+            slot_caps,
+            "ipConnection",
+            "GetIpConnections",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_ip_connections(slot, data).await;
+                });
+            },
+        );
+
+        // Phase 2: redundancyGroup (ST 2022-7 / hot-standby) configured pairs.
+        spawn_xger_slow(
+            slot_caps,
+            "redundancyGroup",
+            "GetRedundancyGroups",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, data| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_redundancy_groups(slot, data).await;
+                });
+            },
+        );
+
+        // Phase 2: redundancyGroupStatus (live state — active leg, switch
+        // count). Single-object return; raw blob into the slot map. Polled at
+        // the same fast cadence as cardStatus so operators see leg switches
+        // promptly.
+        spawn_xger_slow_raw(
+            slot_caps,
+            "redundancyGroupStatus",
+            "GetRedundancyGroupStatus",
+            &client,
+            &state,
+            &cancel,
+            config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    st.set_redundancy_group_status(slot, raw).await;
+                });
+            },
+        );
+
+        // Phase 3a: per-encoder / per-decoder runtime config polls. Different
+        // module names per family (`hipEncoder` vs `hipTsEncoder` vs
+        // `hipDecoder` vs `hipTsDecoder`); each `spawn_iface_slow_raw` call
+        // gates on the slot having actually discovered that module so a bare
+        // X5 silently skips.
+        spawn_iface_slow_raw(
+            slot_caps, "hipEnc", "hipEncoder", "GetEncoders",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_encoders(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipTsEnc", "hipTsEncoder", "GetEncoders",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_encoders(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipDec", "hipDecoder", "GetDecoders",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_decoders(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipTsDec", "hipTsDecoder", "GetDecoders",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_decoders(slot, raw).await; });
+            },
+        );
+
+        // Phase 3b: SCTE-35 / DPI / ESAM splicing surface. Slow polls for
+        // status modules (60 s — splicing changes infrequently); the
+        // scte35LogApi history is fetched on-demand from the command handler.
+        spawn_xger_slow_raw(
+            slot_caps,
+            "dpiStatus",
+            "GetDpiStatus",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_dpi_status(slot, raw).await; });
+            },
+        );
+        spawn_xger_slow_raw(
+            slot_caps,
+            "esamStatus",
+            "GetEsamStatus",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_esam_status(slot, raw).await; });
+            },
+        );
+        spawn_xger_slow_raw(
+            slot_caps,
+            "poisServerStatus",
+            "GetPoisServerStatus",
+            &client,
+            &state,
+            &cancel,
+            slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_pois_server_status(slot, raw).await; });
+            },
+        );
+
         // poolConfig / lockStatus / psiStatus — single-object returns (not
         // arrays). Use the raw `result` blob.
         spawn_xger_slow_raw(
@@ -771,6 +909,50 @@ fn spawn_xger_slow_raw<F>(
             let apply = apply.clone();
             Box::pin(async move {
                 let method = format!("Xger:{version}/{module}/{command}");
+                let r = c.call_board(slot, &method, json!({})).await?;
+                apply(st, slot, r);
+                Ok(())
+            })
+        },
+    );
+}
+
+/// Phase 3a/3b helper: parameterised twin of `spawn_xger_slow_raw` that
+/// takes the interface name as an argument so we can poll non-Xger modules
+/// (`hipEnc:*`, `hipTsEnc:*`, `hipDec:*`, `hipTsDec:*`) with the same
+/// idiom. Gates on the slot having actually discovered the
+/// `<interface>/<module>` pair so a chassis without that family silently
+/// skips spawning the task.
+fn spawn_iface_slow_raw<F>(
+    slot_caps: &super::capabilities::SlotCapabilities,
+    interface: &'static str,
+    module: &'static str,
+    command: &'static str,
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+    interval_secs: u64,
+    apply: F,
+) where
+    F: Fn(SharedAppearXState, u32, Value) + Send + Sync + 'static + Clone,
+{
+    let slot = slot_caps.slot;
+    let version = match slot_caps.module_version(interface, module) {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    let apply = apply.clone();
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        interval_secs,
+        &format!("{interface}-{module}-slot{slot}"),
+        move |c, st| {
+            let version = version.clone();
+            let apply = apply.clone();
+            Box::pin(async move {
+                let method = format!("{interface}:{version}/{module}/{command}");
                 let r = c.call_board(slot, &method, json!({})).await?;
                 apply(st, slot, r);
                 Ok(())

@@ -186,6 +186,26 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
+    // Phase 2: ST 2022-7 / hot-standby redundancy groups. Configured via
+    // `redundancyGroup/Set/DeleteRedundancyGroups`; live state via
+    // `redundancyGroupStatus/GetRedundancyGroupStatus`. Only present on
+    // commissioned units that pair two ipInterfaces into a redundant leg.
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "redundancyGroup",
+        command: "GetRedundancyGroups",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "redundancyGroupStatus",
+        command: "GetRedundancyGroupStatus",
+        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        params: ProbeParams::Empty,
+    },
     ProbeEntry {
         family: "Xger",
         interface: "Xger",
@@ -262,6 +282,93 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         module: "hipEncStatus",
         command: "GetEncoderTransportStatus",
         versions: &["1.11", "1.6", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // ── Phase 3a: Pure-JPEG-XS decoder family (hipDec reference). Mirrors
+    //    `hipEnc` shape on the decoder side.
+    ProbeEntry {
+        family: "hipDec",
+        interface: "hipDec",
+        module: "hipDecoder",
+        command: "GetDecoders",
+        versions: &["1.7", "1.5", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "hipDec",
+        interface: "hipDec",
+        module: "hipDecStatus",
+        command: "GetDecoderStatus",
+        versions: &["1.7", "1.5", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // ── Phase 3a: HEVC-TS decoder family (hipTsDec reference).
+    ProbeEntry {
+        family: "hipTsDec",
+        interface: "hipTsDec",
+        module: "hipTsDecoder",
+        command: "GetDecoders",
+        versions: &["1.5", "1.4", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "hipTsDec",
+        interface: "hipTsDec",
+        module: "hipDecStatus",
+        command: "GetDecoderStatus",
+        versions: &["1.5", "1.4", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // ── Phase 3b: SCTE-35 / DPI / ESAM splicing surface. All on the Xger
+    //    card-manager interface; only present on commissioned units that
+    //    enable splicing. Probes are read-only Get* — never trigger a
+    //    splice from probing.
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "dpi",
+        command: "GetDpi",
+        versions: &["2.55", "2.54", "2.49", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "dpiStatus",
+        command: "GetDpiStatus",
+        versions: &["2.55", "2.54", "2.49", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "esamConfig",
+        command: "GetEsamConfig",
+        versions: &["2.55", "2.54", "2.49", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "esamStatus",
+        command: "GetEsamStatus",
+        versions: &["2.55", "2.54", "2.49", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "scte35Config",
+        command: "GetScte35Config",
+        versions: &["2.55", "2.54", "2.49", "1.1"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "Xger",
+        interface: "Xger",
+        module: "poisServerStatus",
+        command: "GetPoisServerStatus",
+        versions: &["2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     // ── SDI physical-card family (sdi reference; lowercase modules).

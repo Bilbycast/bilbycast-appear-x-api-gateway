@@ -259,9 +259,11 @@ async fn main() -> Result<()> {
             env!("CARGO_PKG_VERSION"),
             discovery_target_address.clone(),
         );
+        let mmi_versions = appear_x::commands::MmiVersions::from(&discovery_cfg_polling);
         let real_handler = Arc::new(appear_x::commands::AppearXCommandHandler::new(
             discovery_client.clone(),
             shared_state.clone(),
+            mmi_versions,
         ));
         discovery_handler_slot.install(real_handler).await;
 

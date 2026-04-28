@@ -54,6 +54,35 @@ pub struct AppearXState {
     pub card_allocations: BTreeMap<u32, Vec<Value>>,
     /// `Xger:*/poolConfig/GetPoolConfig` — pool configuration.
     pub pool_config: BTreeMap<u32, Value>,
+    /// `Xger:*/ipConnection/GetIpConnections` — Phase 2: actual IP transport
+    /// bindings (UDP / RTP / SRT / RIST). Where SRT-mode (caller / listener /
+    /// rendezvous), latency, encryption passphrase, FEC mode all live.
+    pub ip_connections: BTreeMap<u32, Vec<Value>>,
+    /// `Xger:*/redundancyGroup/GetRedundancyGroups` — Phase 2: ST 2022-7 /
+    /// hot-standby redundancy group config. Pairs two ipInterfaces into one
+    /// logical leg.
+    pub redundancy_groups: BTreeMap<u32, Vec<Value>>,
+    /// `Xger:*/redundancyGroupStatus/GetRedundancyGroupStatus` — Phase 2: live
+    /// status of every configured redundancy group (active leg, switch count).
+    pub redundancy_group_status: BTreeMap<u32, Value>,
+    /// Phase 3a: per-encoder runtime config blobs from
+    /// `hipEnc:*/hipEncoder/GetEncoders` /
+    /// `hipTsEnc:*/hipTsEncoder/GetEncoders` /
+    /// `hipDec:*/hipDecoder/GetDecoders` /
+    /// `hipTsDec:*/hipTsDecoder/GetDecoders`. Per-slot raw blob; the manager UI
+    /// surfaces an Edit-JSON modal because the schema varies by family and
+    /// firmware. Operator runs Get → mutate → Set for live bitrate hot-changes,
+    /// intra-period overrides, dynamic-range tweaks.
+    pub hip_encoders: BTreeMap<u32, Value>,
+    pub hip_decoders: BTreeMap<u32, Value>,
+    /// Phase 3b: SCTE-35 / DPI / ESAM splicing surface. Each module is a
+    /// raw per-slot blob — schemas are stable enough that a JSON-textarea
+    /// editor is reasonable, but the manager UI also exposes a structured
+    /// splice-history viewer fed by the on-demand `get_scte35_history`
+    /// command (NOT polled — log can be large).
+    pub dpi_status: BTreeMap<u32, Value>,
+    pub esam_status: BTreeMap<u32, Value>,
+    pub pois_server_status: BTreeMap<u32, Value>,
     /// `Xger:*/lockStatus/GetLockStatus` — input lock status for each
     /// encoder. Present only on commissioned units.
     pub lock_status: BTreeMap<u32, Value>,
@@ -217,6 +246,48 @@ impl SharedAppearXState {
         g.pool_config.insert(slot, v);
     }
 
+    pub async fn set_ip_connections(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.ip_connections
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+
+    pub async fn set_redundancy_groups(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.redundancy_groups
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+
+    pub async fn set_redundancy_group_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.redundancy_group_status.insert(slot, v);
+    }
+
+    pub async fn set_hip_encoders(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.hip_encoders.insert(slot, v);
+    }
+
+    pub async fn set_hip_decoders(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.hip_decoders.insert(slot, v);
+    }
+
+    pub async fn set_dpi_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.dpi_status.insert(slot, v);
+    }
+
+    pub async fn set_esam_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.esam_status.insert(slot, v);
+    }
+
+    pub async fn set_pois_server_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.pois_server_status.insert(slot, v);
+    }
+
     pub async fn set_lock_status(&self, slot: u32, v: Value) {
         let mut g = self.inner.write().await;
         g.lock_status.insert(slot, v);
@@ -246,16 +317,6 @@ impl SharedAppearXState {
             .and_then(|s| s.module_version(interface, module).map(|v| v.to_string()))
     }
 
-    /// Best-effort interface version for a slot + interface, across any
-    /// module discovered under that interface. Falls back to `None` if the
-    /// interface didn't probe.
-    pub fn any_interface_version(&self, slot: u32, interface: &str) -> Option<String> {
-        self.caps
-            .slots
-            .get(&slot)
-            .and_then(|s| s.any_interface_version(interface).map(|v| v.to_string()))
-    }
-
     /// Build the consolidated stats payload to send to the manager.
     ///
     /// Per-slot maps are flattened to top-level arrays where each item carries
@@ -277,6 +338,8 @@ impl SharedAppearXState {
         let xger_ip_interfaces_flat = flatten_with_slot(&g.xger_ip_interfaces);
         let card_allocations_flat = flatten_with_slot(&g.card_allocations);
         let output_services_flat = flatten_with_slot(&g.output_services);
+        let ip_connections_flat = flatten_with_slot(&g.ip_connections);
+        let redundancy_groups_flat = flatten_with_slot(&g.redundancy_groups);
 
         // card_status / pool_config / lock_status / psi_status are single
         // opaque objects per slot — deliver as slot-indexed maps so the
@@ -285,6 +348,12 @@ impl SharedAppearXState {
         let pool_config_map = slot_map_to_json(&g.pool_config);
         let lock_status_map = slot_map_to_json(&g.lock_status);
         let psi_status_map = slot_map_to_json(&g.psi_status);
+        let redundancy_group_status_map = slot_map_to_json(&g.redundancy_group_status);
+        let hip_encoders_map = slot_map_to_json(&g.hip_encoders);
+        let hip_decoders_map = slot_map_to_json(&g.hip_decoders);
+        let dpi_status_map = slot_map_to_json(&g.dpi_status);
+        let esam_status_map = slot_map_to_json(&g.esam_status);
+        let pois_server_status_map = slot_map_to_json(&g.pois_server_status);
 
         // Health signals derived from card_status for easy metric extraction
         // on the manager side (and human-readable header badges).
@@ -322,10 +391,18 @@ impl SharedAppearXState {
             "xger_ip_interfaces": xger_ip_interfaces_flat,
             "card_allocations": card_allocations_flat,
             "output_services": output_services_flat,
+            "ip_connections": ip_connections_flat,
+            "redundancy_groups": redundancy_groups_flat,
+            "redundancy_group_status": redundancy_group_status_map,
             "card_status": card_status_map,
             "pool_config": pool_config_map,
             "lock_status": lock_status_map,
             "psi_status": psi_status_map,
+            "hip_encoders": hip_encoders_map,
+            "hip_decoders": hip_decoders_map,
+            "dpi_status": dpi_status_map,
+            "esam_status": esam_status_map,
+            "pois_server_status": pois_server_status_map,
             "health_signals": health_signals,
         })
     }
