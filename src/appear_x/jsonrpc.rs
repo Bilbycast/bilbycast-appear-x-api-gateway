@@ -70,6 +70,23 @@ impl JsonRpcClient {
         })
     }
 
+    /// Borrow the shared `reqwest::Client`. Reused by the SDK's HTTP proxy
+    /// (`bilbycast_gateway_sdk::HttpProxyConfig`) so the device-UI reverse
+    /// proxy honours the same TLS pinning / self-signed posture as the
+    /// JSON-RPC poll path. Important: do NOT enable `cookie_store(true)` on
+    /// this client — the proxy must round-trip browser cookies via the
+    /// `Cookie` header per request, not stash them server-side. The current
+    /// builder above does not enable cookie_store, and that is intentional.
+    pub fn shared_http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// Borrow the chassis base URL (`https://<address>`). Used to construct
+    /// the `HttpProxyConfig` target without re-parsing the config.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Authenticate with the Appear X unit via BeginSession.
     pub async fn authenticate(&self) -> Result<()> {
         let url = format!("{}/mmi/api/jsonrpc", self.base_url);

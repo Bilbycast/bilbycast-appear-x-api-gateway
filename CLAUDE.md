@@ -131,6 +131,14 @@ Translates manager commands into Appear X JSON-RPC calls:
 
 Write commands follow the Appear X Get/Set symmetry pattern: the data structures for GetInputs and SetInputs are identical.
 
+### Web-UI reverse proxy (`web-ui-proxy` capability)
+
+The gateway opts into the SDK's HTTP reverse-proxy in `main.rs` via `GatewayClient::with_http_proxy(...)`, hard-pinned to `https://{appear_x.address}` and reusing the existing `JsonRpcClient::shared_http_client()` so TLS pinning / self-signed posture / connection pool are honoured. The capability string `web-ui-proxy` is added to the `capabilities` array on every health heartbeat — both the steady-state polling path (`appear_x/polling.rs`) and the discovery-phase fallback in `main.rs` — so the manager UI can gate the "Open Device Web UI" button per-node.
+
+When the manager opens a `proxy_open` envelope, the SDK's `ProxyDispatcher` validates the URL against the pinned base, fires a `reqwest::Request` against the chassis with `Accept-Encoding: identity` + `Referer: <chassis URL>`, and streams the response back as chunked `proxy_data { dir: "resp" }` frames (≤ 2 MiB per frame). Per-node concurrent-stream cap is 8 — excess `proxy_open`s get `proxy_close { reason: "stream_limit" }` immediately.
+
+**TLS pinning matters more for the device-UI proxy than for JSON-RPC polling.** The proxy carries operator-typed device admin credentials in form bodies; if the gateway accepts a self-signed device cert without pinning (`appear_x.accept_self_signed_cert: true` and no `cert_fingerprint`), a MITM in the LAN between the gateway and chassis can capture those credentials. Set `appear_x.cert_fingerprint` (SHA-256 leaf cert pin) for any deployment where the proxy will be used — pinning is the recommended posture for production regardless, and the proxy elevates that recommendation to a hard requirement for credential safety. Reference: [`bilbycast-manager/docs/web-ui-proxy.md`](../bilbycast-manager/docs/web-ui-proxy.md).
+
 ## Configuration
 
 TOML config file. See `config/example.toml` for a complete template.

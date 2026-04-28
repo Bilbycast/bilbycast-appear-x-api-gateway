@@ -772,6 +772,9 @@ fn spawn_alarms_poller(
                     "status": status,
                     "alarms": alarms_value,
                     "version": env!("CARGO_PKG_VERSION"),
+                    // Advertised so the manager UI gates the
+                    // "Open Device Web UI" button on this node.
+                    "capabilities": [bilbycast_gateway_sdk::PROXY_CAPABILITY],
                 });
                 let _ = emitter.emit_health_with_target(health, target).await;
 
