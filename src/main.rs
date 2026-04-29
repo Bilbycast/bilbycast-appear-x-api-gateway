@@ -118,20 +118,6 @@ async fn main() -> Result<()> {
     let deferred_handler = Arc::new(appear_x::commands::DeferredAppearXHandler::new());
     let mut client = GatewayClient::connect(gateway_cfg, deferred_handler.clone()).await?;
 
-    // Web-UI reverse proxy: lets the manager surface the chassis's HTTP
-    // management UI through the existing WSS link, no edge-tunnel needed.
-    // Reuses the JSON-RPC reqwest client so TLS pinning / self-signed
-    // posture / connection pool are honoured. Hard-pinned to the chassis's
-    // base URL — `proxy_open` requests that resolve outside the pin are
-    // refused with `proxy_close { reason: "invalid_url" }` at the SDK.
-    let proxy_target = reqwest::Url::parse(appear_client.base_url())
-        .with_context(|| format!("Invalid Appear X base URL: {}", appear_client.base_url()))?;
-    let proxy_cfg = bilbycast_gateway_sdk::HttpProxyConfig::new(
-        proxy_target,
-        appear_client.shared_http_client().clone(),
-    );
-    client = client.with_http_proxy(proxy_cfg);
-
     let shutdown = client.shutdown_token();
     let emitter = client.emitter();
 
@@ -218,7 +204,7 @@ async fn main() -> Result<()> {
                 "status": "critical",
                 "alarms": [],
                 "version": env!("CARGO_PKG_VERSION"),
-                "capabilities": [bilbycast_gateway_sdk::PROXY_CAPABILITY],
+                "capabilities": [],
             });
             if let Err(e) = hb_emitter.emit_health_with_target(health, target).await {
                 debug!("Failed to emit discovery-phase health: {e}");

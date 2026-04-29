@@ -292,9 +292,18 @@ pub async fn run_polling(
             &cancel,
             slow,
             |st, slot, data| {
+                // Flatten the API's nested `IpInterfaceStruct.interfaces.single`
+                // wrapping onto each value object so the manager UI form sees
+                // the same flat shape it submits.
+                let flat = match data {
+                    Value::Array(arr) => Value::Array(
+                        arr.into_iter().map(flatten_ip_interface_value).collect(),
+                    ),
+                    other => other,
+                };
                 let st = st.clone();
                 tokio::spawn(async move {
-                    st.set_xger_ip_interfaces(slot, data).await;
+                    st.set_xger_ip_interfaces(slot, flat).await;
                 });
             },
         );
@@ -314,10 +323,13 @@ pub async fn run_polling(
             },
         );
 
-        // Phase 2: ipConnection (UDP / RTP / SRT / RIST transport bindings).
-        // Only present on commissioned units that load the `Xger:*/ipConnection`
-        // module — bare X5 HEVC SDI doesn't, and `spawn_xger_slow` no-ops if
-        // the module wasn't discovered.
+        // Phase 2: ipConnection. Per Xger:2.55 §27, IpConnection is a
+        // `{label, connection, dejitter?, standard, nmosEnable}` struct where
+        // `standard` is `SMPTE_2022 | SMPTE_2110 | MPEG_TS` — RTP/UDP framing
+        // is implicit per the chosen standard. Only present on commissioned
+        // units that load the `Xger:*/ipConnection` module — bare X5 HEVC SDI
+        // doesn't, and `spawn_xger_slow` no-ops if the module wasn't
+        // discovered.
         spawn_xger_slow(
             slot_caps,
             "ipConnection",
@@ -772,9 +784,7 @@ fn spawn_alarms_poller(
                     "status": status,
                     "alarms": alarms_value,
                     "version": env!("CARGO_PKG_VERSION"),
-                    // Advertised so the manager UI gates the
-                    // "Open Device Web UI" button on this node.
-                    "capabilities": [bilbycast_gateway_sdk::PROXY_CAPABILITY],
+                    "capabilities": [],
                 });
                 let _ = emitter.emit_health_with_target(health, target).await;
 
@@ -873,12 +883,69 @@ fn spawn_xger_slow<F>(
             Box::pin(async move {
                 let method = format!("Xger:{version}/{module}/{command}");
                 let r = c.call_board(slot, &method, json!({})).await?;
-                let data = r.get("data").cloned().unwrap_or(json!([]));
+                let data = data_as_keyed_array(r.get("data").cloned().unwrap_or(json!([])));
                 apply(st, slot, data);
                 Ok(())
             })
         },
     );
+}
+
+/// Several Xger Get* commands return `{data: <map<UUID, T>>}` per the spec
+/// (e.g. §28.3.6 GetIpInterfaces.Response, §27.3.7 GetIpConnections.Response).
+/// The downstream state setters and the manager UI snapshot expect a flat
+/// `Vec<{key, value}>` array. Convert here so the polling path is uniform —
+/// and so a map response from a recent firmware doesn't get silently dropped
+/// by a downstream `as_array()` that returns `None`.
+fn data_as_keyed_array(raw: Value) -> Value {
+    match raw {
+        Value::Array(_) => raw,
+        Value::Object(map) => Value::Array(
+            map.into_iter()
+                .map(|(k, v)| json!({"key": k, "value": v}))
+                .collect(),
+        ),
+        Value::Null => Value::Array(vec![]),
+        other => Value::Array(vec![other]),
+    }
+}
+
+/// IpInterface-specific flatten: Xger:2.55 §28 wraps the operator-visible
+/// fields inside `IpInterfaceStruct.interfaces.single` (a `LogicalInterface`),
+/// while the rest of the chassis-config struct (`ipLink`, `ipFecMode`) sits at
+/// the top level. The manager UI form schema works in a flat shape (label,
+/// enabled, physicalPort, ipv4, ipv6, lldpMode, plus ipLink/ipFecMode hoisted
+/// alongside) and re-wraps to the nested API shape at submit time. Lift the
+/// `interfaces.single` fields up here so the form's "edit existing" path sees
+/// the same shape it submits. `quad` mode is preserved under `_quad` for
+/// future use; not exposed in the form yet (Phase 1 = single only).
+fn flatten_ip_interface_value(item: Value) -> Value {
+    let mut obj = match item {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let value = match obj.remove("value") {
+        Some(Value::Object(v)) => v,
+        Some(other) => {
+            obj.insert("value".to_string(), other);
+            return Value::Object(obj);
+        }
+        None => return Value::Object(obj),
+    };
+    let mut value = value;
+    let interfaces = value.remove("interfaces");
+    if let Some(Value::Object(mut iface_variant)) = interfaces {
+        if let Some(Value::Object(single)) = iface_variant.remove("single") {
+            for (k, v) in single {
+                value.insert(k, v);
+            }
+        }
+        if let Some(quad) = iface_variant.remove("quad") {
+            value.insert("_quad".to_string(), quad);
+        }
+    }
+    obj.insert("value".to_string(), Value::Object(value));
+    Value::Object(obj)
 }
 
 /// Like `spawn_xger_slow` but for commands whose result is a single opaque

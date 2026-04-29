@@ -37,9 +37,8 @@ impl JsonRpcClient {
         //    permissive default. Pin via #1 to upgrade.
         // 3. `accept_self_signed_cert: false` and no fingerprint →
         //    standard CA-chain validation against the system roots.
-        let builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10));
-        let builder = if let Some(ref fp) = config.cert_fingerprint {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+        if let Some(ref fp) = config.cert_fingerprint {
             // The SDK's pinning path doesn't enforce the
             // BILBYCAST_ALLOW_INSECURE env var (the env-var guard is
             // only on the unconditional self-signed path). Pinning
@@ -47,17 +46,18 @@ impl JsonRpcClient {
             // and is safe to enable without the guard.
             let tls_config = bilbycast_gateway_sdk::tls::build_tls_config(false, Some(fp))
                 .map_err(|e| anyhow::anyhow!("Appear X TLS config: {e}"))?;
+            builder = builder.use_preconfigured_tls(tls_config);
             tracing::info!(
                 "Appear X TLS: certificate pinning enabled (fingerprint prefix: {}...)",
                 &fp.chars().take(11).collect::<String>()
             );
-            builder.use_preconfigured_tls(tls_config)
         } else {
             // Preserve historical behaviour exactly when no pin is
             // configured. `accept_self_signed_cert: true` (the default)
             // remains permissive without requiring an env var.
-            builder.danger_accept_invalid_certs(config.accept_self_signed_cert)
-        };
+            builder = builder.danger_accept_invalid_certs(config.accept_self_signed_cert);
+        }
+
         let http = builder.build()?;
 
         Ok(Self {
@@ -68,23 +68,6 @@ impl JsonRpcClient {
             token: Arc::new(RwLock::new(None)),
             request_id: Arc::new(AtomicU64::new(1)),
         })
-    }
-
-    /// Borrow the shared `reqwest::Client`. Reused by the SDK's HTTP proxy
-    /// (`bilbycast_gateway_sdk::HttpProxyConfig`) so the device-UI reverse
-    /// proxy honours the same TLS pinning / self-signed posture as the
-    /// JSON-RPC poll path. Important: do NOT enable `cookie_store(true)` on
-    /// this client — the proxy must round-trip browser cookies via the
-    /// `Cookie` header per request, not stash them server-side. The current
-    /// builder above does not enable cookie_store, and that is intentional.
-    pub fn shared_http_client(&self) -> &reqwest::Client {
-        &self.http
-    }
-
-    /// Borrow the chassis base URL (`https://<address>`). Used to construct
-    /// the `HttpProxyConfig` target without re-parsing the config.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
     }
 
     /// Authenticate with the Appear X unit via BeginSession.

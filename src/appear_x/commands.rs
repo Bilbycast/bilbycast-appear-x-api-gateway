@@ -355,9 +355,12 @@ impl CommandHandler for AppearXCommandHandler {
             )
             .await,
 
-            // Xger write commands — all Get/Set symmetrical. Payload key
-            // mirrors the Appear API (`data: [...]`).
-            "set_coder_services" => xger_set(
+            // Xger write commands — all Get/Set symmetrical. The Appear API
+            // shape is `{data: <map<UUID, T>>}`; the manager UI ships
+            // `[{key, value}]` to keep round-trip symmetry with the flattened
+            // GET-side snapshot. `xger_set_keyed` folds the array back into
+            // the map shape the chassis expects.
+            "set_coder_services" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -376,7 +379,7 @@ impl CommandHandler for AppearXCommandHandler {
                 &action,
             )
             .await,
-            "set_multi_services" => xger_set(
+            "set_multi_services" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -395,7 +398,7 @@ impl CommandHandler for AppearXCommandHandler {
                 &action,
             )
             .await,
-            "set_audio_profiles" => xger_set(
+            "set_audio_profiles" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -414,7 +417,7 @@ impl CommandHandler for AppearXCommandHandler {
                 &action,
             )
             .await,
-            "set_xger_ip_interfaces" => xger_set(
+            "set_xger_ip_interfaces" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -433,7 +436,7 @@ impl CommandHandler for AppearXCommandHandler {
                 &action,
             )
             .await,
-            "set_card_allocations" => xger_set(
+            "set_card_allocations" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -454,7 +457,11 @@ impl CommandHandler for AppearXCommandHandler {
             )
             .await,
 
-            // Phase 2: ipConnection (UDP / RTP / SRT / RIST transport bindings).
+            // Phase 2: ipConnection. Per Xger:2.55 §27 the IpConnection struct
+            // is `{label, connection, dejitter?, standard, nmosEnable}` where
+            // `standard` is `SMPTE_2022 | SMPTE_2110 | MPEG_TS` — there is NO
+            // free transport-protocol selector (UDP/RTP are implicit per the
+            // chosen standard). SRT and RIST are not part of this surface.
             "get_ip_connections" => xger_call(
                 &self.client,
                 &self.state,
@@ -464,7 +471,7 @@ impl CommandHandler for AppearXCommandHandler {
                 json!({}),
             )
             .await,
-            "set_ip_connections" => xger_set(
+            "set_ip_connections" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -494,7 +501,7 @@ impl CommandHandler for AppearXCommandHandler {
                 json!({}),
             )
             .await,
-            "set_redundancy_groups" => xger_set(
+            "set_redundancy_groups" => xger_set_keyed(
                 &self.client,
                 &self.state,
                 slot,
@@ -699,9 +706,18 @@ async fn xger_call(
         .map_err(vendor_error)
 }
 
-/// Issue an Xger Set command with a `data: [...]` body. `payload_key` is the
-/// action field where the operator places the array (e.g. `coder_services`).
-async fn xger_set(
+/// Issue an Xger Set command whose API shape is `{data: <map<UUID, T>>}`.
+///
+/// The manager UI sends `[{key: "<uuid>", value: <T>}]` to keep round-trip
+/// symmetry with the flattened GET response shape exposed in the snapshot.
+/// This helper folds that array into the API's UUID-keyed map.
+///
+/// Per the Xger:2.55 spec (e.g. §28.2.2 ipInterface/SetIpInterfaces): "Interface
+/// uuids are deterministically calculated. The uuids used in the RPC Request are
+/// ignored." Other map-shaped Set commands behave the same — the chassis treats
+/// the supplied UUID as opaque, so the manager-side UUID is preserved on the
+/// wire for clean round-trip even though the chassis may re-key.
+async fn xger_set_keyed(
     client: &JsonRpcClient,
     state: &SharedAppearXState,
     slot: u32,
@@ -712,26 +728,48 @@ async fn xger_set(
 ) -> Result<Value, CommandError> {
     let action_name = command_to_action(command);
     let ver = xger_version(state, slot, module, &action_name)?;
-    let data = action.get(payload_key).cloned().ok_or_else(|| {
+    let raw = action.get(payload_key).cloned().ok_or_else(|| {
         CommandError::validation(format!("missing '{payload_key}' field").as_str())
     })?;
-    debug!(
-        "{} on slot {}: {} items",
-        command,
-        slot,
-        data.as_array().map(|a| a.len()).unwrap_or(0)
-    );
+    let arr = raw.as_array().ok_or_else(|| {
+        CommandError::validation(
+            format!("'{payload_key}' must be an array of {{key, value}} objects").as_str(),
+        )
+    })?;
+    let mut map = serde_json::Map::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let obj = item.as_object().ok_or_else(|| {
+            CommandError::validation(
+                format!("'{payload_key}[{i}]' must be an object with 'key' and 'value'").as_str(),
+            )
+        })?;
+        let key = obj
+            .get("key")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                CommandError::validation(
+                    format!("'{payload_key}[{i}].key' must be a non-empty string").as_str(),
+                )
+            })?;
+        let value = obj.get("value").cloned().ok_or_else(|| {
+            CommandError::validation(format!("'{payload_key}[{i}].value' is missing").as_str())
+        })?;
+        map.insert(key.to_string(), value);
+    }
+    debug!("{} on slot {}: {} entries", command, slot, map.len());
     client
         .call_board(
             slot,
             &format!("Xger:{ver}/{module}/{command}"),
-            json!({ "data": data }),
+            json!({ "data": Value::Object(map) }),
         )
         .await
         .map_err(vendor_error)
 }
 
-/// Like `xger_set` but the payload is a single object, not an array.
+/// Like `xger_set_keyed` but the payload is a single object — the API shape
+/// is `{data: T}` (not a UUID-keyed map). Used by `set_pool_config` etc.
 async fn xger_set_raw(
     client: &JsonRpcClient,
     state: &SharedAppearXState,
