@@ -61,7 +61,7 @@ The node should appear as **online** in the manager dashboard. Stats (inputs, ou
 
 | Setting | Required | Default | Description |
 |---------|----------|---------|-------------|
-| `manager.url` | Yes | — | Manager WebSocket URL (must use `wss://`) |
+| `manager.urls` | Yes | — | Ordered list of manager WebSocket URLs (1–16 entries, each `wss://`) |
 | `manager.registration_token` | First run | — | One-time token from manager |
 | `manager.credentials_file` | No | `credentials.json` | Where to persist node_id + node_secret |
 | `manager.accept_self_signed_cert` | No | `false` | Accept self-signed certs (requires `BILBYCAST_ALLOW_INSECURE=1`) |

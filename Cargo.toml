@@ -14,7 +14,7 @@ bilbycast-gateway-sdk = { path = "../bilbycast-gateway-sdk" }
 tokio = { version = "1.52.1", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-reqwest = { version = "0.13.2", features = ["json", "rustls"], default-features = false }
+reqwest = { version = "0.13.3", features = ["json", "rustls"], default-features = false }
 toml = "1.1.2"
 clap = { version = "4.6.1", features = ["derive"] }
 tracing = "0.1.44"
