@@ -49,6 +49,12 @@ pub struct GatewayIdentity {
     pub failure_threshold: u32,
     /// Dwell time (seconds) before a state flip fires a `target_*` event.
     pub event_dwell_secs: u64,
+    /// Capability strings the manager UI gates feature surfaces on
+    /// (e.g. `"upgrade"` for the remote-upgrade button). Populated in
+    /// `main.rs` from the wired-up subsystems and folded into every
+    /// health heartbeat so the manager's `cached_health.capabilities`
+    /// reflects what this binary can actually do.
+    pub capabilities: Vec<&'static str>,
 }
 
 /// Interval (seconds) at which the consolidated stats snapshot is pushed to
@@ -784,7 +790,7 @@ fn spawn_alarms_poller(
                     "status": status,
                     "alarms": alarms_value,
                     "version": env!("CARGO_PKG_VERSION"),
-                    "capabilities": [],
+                    "capabilities": identity.capabilities,
                 });
                 let _ = emitter.emit_health_with_target(health, target).await;
 

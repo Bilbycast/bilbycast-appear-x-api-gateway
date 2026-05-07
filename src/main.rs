@@ -14,10 +14,15 @@
 mod appear_x;
 mod config;
 mod event_gate;
+mod upgrade_profile;
 
 use anyhow::{Context, Result};
+use bilbycast_gateway_sdk::upgrade::{
+    self, run_boot_watchdog, UpgradeCoordinator, UpgradeEvent, WatchdogOutcome,
+};
 use bilbycast_gateway_sdk::{
-    CredentialStore, GatewayClient, GatewayConfig, PersistedCredentials,
+    CredentialStore, Emitter, EventSeverity, GatewayClient, GatewayConfig, GatewayEvent,
+    PersistedCredentials,
 };
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -92,6 +97,59 @@ async fn main() -> Result<()> {
         format!("Failed to load credentials from {credentials_file}")
     })?;
 
+    // Remote-upgrade event channel — wired to the SDK's UpgradeCoordinator
+    // and the boot watchdog. The receiver feeds an event-forwarder task
+    // (spawned below) that translates each `UpgradeEvent` into a
+    // `GatewayEvent` on the SDK Emitter, so upgrade lifecycle events
+    // ride the same WS event path as every other vendor event the
+    // sidecar emits.
+    //
+    // Channel exists even when `[upgrade]` is unset so the boot watchdog
+    // and (eventually) the forwarder don't need conditional plumbing.
+    // When upgrades are unconfigured the channel sits idle.
+    let (upgrade_event_tx, upgrade_event_rx) =
+        tokio::sync::mpsc::channel::<UpgradeEvent>(64);
+
+    // Boot watchdog. Runs *before* we connect to the manager so a
+    // crash-loop on a freshly-staged binary triggers the symlink
+    // revert + `exit(1)` on the (max_boot_attempts + 1)th boot. The
+    // queued `upgrade_rolled_back` Critical event drains over the WS
+    // once the forwarder is up. No-op when `[upgrade]` is unset or
+    // `enabled = false`.
+    match run_boot_watchdog(cfg.upgrade.as_ref(), &upgrade_event_tx) {
+        Ok(WatchdogOutcome::Continue) => {}
+        Ok(WatchdogOutcome::PendingHealth { attempt }) => {
+            info!(
+                "Upgrade boot watchdog: this is boot attempt {attempt} on the staged version; \
+                 will be promoted to stable after the configured health window."
+            );
+        }
+        Ok(WatchdogOutcome::RolledBack { from_version, to_version }) => {
+            warn!(
+                "Upgrade boot watchdog: rolled back from {from_version} to {to_version} on \
+                 the previous boot — `upgrade_rolled_back` will surface to the manager on auth."
+            );
+        }
+        Err(e) => warn!("upgrade boot watchdog error: {e:#}"),
+    }
+
+    // Process-wide upgrade coordinator. `None` when `[upgrade]` is unset;
+    // the `upgrade_binary` command then returns `upgrade_disabled` and
+    // the `"upgrade"` capability is not advertised. The same `Arc` is
+    // shared between the deferred handler (sidecar self-upgrade pre-
+    // discovery) and the real handler (post-discovery).
+    let upgrade_coord: Option<Arc<UpgradeCoordinator>> = cfg.upgrade.as_ref().map(|up_cfg| {
+        Arc::new(UpgradeCoordinator::new(
+            upgrade_profile::PROFILE,
+            up_cfg.clone(),
+            upgrade_event_tx.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ))
+    });
+    if upgrade_coord.is_some() {
+        info!("upgrade coordinator installed (profile: {})", upgrade_profile::PROFILE.repo);
+    }
+
     // Long SDK heartbeat (5 min). The SDK's default `{status:"ok"}` heartbeat
     // would otherwise overwrite our rich `gateway_target`-bearing heartbeat
     // in the manager's `cached_health` every 15 s, and the dashboard would
@@ -115,11 +173,42 @@ async fn main() -> Result<()> {
         gateway_cfg.registration_token = cfg.manager.registration_token.clone();
     }
 
-    let deferred_handler = Arc::new(appear_x::commands::DeferredAppearXHandler::new());
+    let deferred_handler = Arc::new(appear_x::commands::DeferredAppearXHandler::new(
+        upgrade_coord.clone(),
+    ));
     let mut client = GatewayClient::connect(gateway_cfg, deferred_handler.clone()).await?;
 
     let shutdown = client.shutdown_token();
     let emitter = client.emitter();
+
+    // Drain queued upgrade events to the manager via the SDK Emitter.
+    // Started after `client.emitter()` is available so any boot-watchdog
+    // events that arrived synchronously above flush on the first WS
+    // beat. Lives for the process lifetime; cancelled cleanly via the
+    // shared shutdown token.
+    spawn_upgrade_event_forwarder(upgrade_event_rx, emitter.clone(), shutdown.clone());
+
+    // Periodic watchdog: promotes `PendingHealth` → `Stable` after the
+    // configured boot-health window, emitting `upgrade_completed` once.
+    // Only spawned when upgrades are enabled — for `enabled = false`
+    // operators the state machine never enters `PendingHealth`.
+    if let Some(ref up_cfg) = cfg.upgrade {
+        if up_cfg.enabled {
+            let install_root = up_cfg.install_root.clone();
+            let cfg_clone = up_cfg.clone();
+            let tx = upgrade_event_tx.clone();
+            let cancel = shutdown.clone();
+            tokio::spawn(upgrade::watchdog::run_watchdog_periodic(
+                install_root, cfg_clone, tx, cancel,
+            ));
+
+            // Healthy-beat recorder: stamps `state.json.last_health_at`
+            // every 15 s so the periodic watchdog can promote
+            // `PendingHealth` → `Stable` once the boot-health window
+            // expires with continuous beats.
+            spawn_health_beat_recorder(up_cfg.install_root.clone(), shutdown.clone());
+        }
+    }
 
     // Persist credentials after first-time registration.
     let store_cb = store.clone();
@@ -146,6 +235,16 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Capability strings advertised on every health heartbeat. The
+    // manager UI gates per-feature surfaces (e.g. the Upgrade button)
+    // on these. `"upgrade"` is unconditional — the SDK upgrade module
+    // is always compiled in, mirroring the edge's baseline. When the
+    // operator hasn't wired `[upgrade]` in the TOML, the runtime
+    // dispatch (`dispatch_upgrade_binary`) returns `upgrade_disabled`
+    // with a pointer at the missing config; the button stays visible
+    // either way so operators can discover the feature.
+    let capabilities: Vec<&'static str> = vec!["upgrade"];
+
     // Spawn discovery + polling startup in the background. While discovery
     // retries, this task emits a health heartbeat with
     // `gateway_target.reachable = false` on every failed attempt so the
@@ -160,6 +259,8 @@ async fn main() -> Result<()> {
     let discovery_emitter = emitter.clone();
     let discovery_handler_slot = deferred_handler.clone();
     let discovery_cancel = shutdown.clone();
+    let discovery_upgrade_coord = upgrade_coord.clone();
+    let discovery_capabilities = capabilities.clone();
     // Shared "last classified error" published by the discovery loop and
     // read by the heartbeat task — keeps the two tasks decoupled so the
     // heartbeat runs on a steady 10 s cadence regardless of how long each
@@ -179,6 +280,7 @@ async fn main() -> Result<()> {
     let hb_phase = discovery_phase.clone();
     let hb_target_address = cfg.appear_x.address.clone();
     let hb_cancel = shutdown.clone();
+    let hb_capabilities = capabilities.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
@@ -204,7 +306,7 @@ async fn main() -> Result<()> {
                 "status": "critical",
                 "alarms": [],
                 "version": env!("CARGO_PKG_VERSION"),
-                "capabilities": [],
+                "capabilities": hb_capabilities,
             });
             if let Err(e) = hb_emitter.emit_health_with_target(health, target).await {
                 debug!("Failed to emit discovery-phase health: {e}");
@@ -266,6 +368,7 @@ async fn main() -> Result<()> {
             discovery_client.clone(),
             shared_state.clone(),
             mmi_versions,
+            discovery_upgrade_coord,
         ));
         discovery_handler_slot.install(real_handler).await;
 
@@ -274,6 +377,7 @@ async fn main() -> Result<()> {
             gateway_host: appear_x::reachability::detect_hostname(),
             failure_threshold: discovery_appear_x_cfg.reachability_failure_threshold,
             event_dwell_secs: discovery_appear_x_cfg.reachability_event_dwell_secs,
+            capabilities: discovery_capabilities,
         };
         if let Err(e) = appear_x::polling::run_polling(
             discovery_client,
@@ -295,6 +399,74 @@ async fn main() -> Result<()> {
 
     info!("Gateway shut down cleanly");
     Ok(())
+}
+
+/// Drain `upgrade_event_rx` and forward each [`UpgradeEvent`] to the manager
+/// over the SDK's [`Emitter`] as a [`GatewayEvent`]. Mirrors the edge's
+/// `manager::events::EventSender` upgrade-event categorisation but lives
+/// here instead of inside the SDK so the SDK stays Emitter-agnostic.
+///
+/// Lives for the process lifetime; cancelled via the shared shutdown token.
+fn spawn_upgrade_event_forwarder(
+    mut upgrade_event_rx: tokio::sync::mpsc::Receiver<UpgradeEvent>,
+    emitter: Emitter,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                maybe = upgrade_event_rx.recv() => {
+                    let Some(ev) = maybe else { return; };
+                    let severity = match ev.severity {
+                        "critical" => EventSeverity::Critical,
+                        "major"    => EventSeverity::Major,
+                        "minor"    => EventSeverity::Minor,
+                        _          => EventSeverity::Info,
+                    };
+                    // Build details with the structured fields the manager
+                    // UI looks for (`error_code`, version pair, channel,
+                    // optional size).
+                    let mut details = serde_json::Map::new();
+                    details.insert("error_code".to_string(), json!(ev.error_code));
+                    if let Some(v) = ev.from_version.as_ref() { details.insert("from_version".into(), json!(v)); }
+                    if let Some(v) = ev.to_version.as_ref()   { details.insert("to_version".into(),   json!(v)); }
+                    if let Some(c) = ev.channel.as_ref()      { details.insert("channel".into(),      json!(c)); }
+                    if let Some(b) = ev.size_bytes            { details.insert("size_bytes".into(),   json!(b)); }
+                    let event = GatewayEvent::new(severity, "upgrade", ev.message)
+                        .with_error_code(ev.error_code)
+                        .with_details(serde_json::Value::Object(details));
+                    if let Err(e) = emitter.emit_event(event).await {
+                        debug!("upgrade event forwarder: emit failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Periodically tap the upgrade state file with a healthy-beat marker so
+/// the periodic watchdog can promote `PendingHealth` → `Stable`. Wired
+/// to the alarms-poll heartbeat cadence — the same heartbeat the
+/// reachability tracker uses, so a "manager+chassis both happy" beat is
+/// what drives finalisation. Implemented by `record_healthy_beat`
+/// in the SDK; threaded in here as a separate light tokio task so the
+/// polling engine doesn't need to know about upgrades.
+fn spawn_health_beat_recorder(
+    install_root: std::path::PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => {
+                    upgrade::watchdog::record_healthy_beat(&install_root);
+                }
+            }
+        }
+    });
 }
 
 /// Connect to the configured Appear X unit and exercise each polling JSON-RPC

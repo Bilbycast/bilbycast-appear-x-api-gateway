@@ -22,6 +22,7 @@
 //! remapping fields.
 
 use async_trait::async_trait;
+use bilbycast_gateway_sdk::upgrade::{error_codes as upgrade_error_codes, UpgradeCoordinator};
 use bilbycast_gateway_sdk::{CommandError, CommandHandler};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -56,11 +57,27 @@ pub struct AppearXCommandHandler {
     client: JsonRpcClient,
     state: SharedAppearXState,
     mmi: MmiVersions,
+    /// Optional remote-upgrade coordinator. `None` when the operator left
+    /// `[upgrade]` out of the TOML; the `upgrade_binary` arm then returns
+    /// `upgrade_disabled`. Mirrors the edge's `global_coordinator()`
+    /// pattern but kept on the handler so the SDK's stateless dispatch
+    /// model holds.
+    upgrade_coord: Option<Arc<UpgradeCoordinator>>,
 }
 
 impl AppearXCommandHandler {
-    pub fn new(client: JsonRpcClient, state: SharedAppearXState, mmi: MmiVersions) -> Self {
-        Self { client, state, mmi }
+    pub fn new(
+        client: JsonRpcClient,
+        state: SharedAppearXState,
+        mmi: MmiVersions,
+        upgrade_coord: Option<Arc<UpgradeCoordinator>>,
+    ) -> Self {
+        Self {
+            client,
+            state,
+            mmi,
+            upgrade_coord,
+        }
     }
 }
 
@@ -71,17 +88,26 @@ impl AppearXCommandHandler {
 /// = false`; once discovery succeeds the real [`AppearXCommandHandler`] is
 /// installed and every command thereafter forwards to it.
 ///
-/// While the inner handler is `None`, every command returns a
+/// While the inner handler is `None`, vendor commands return a
 /// `discovery_in_progress` `CommandError` so the manager UI can show a
 /// "chassis unreachable" banner instead of a generic timeout.
+///
+/// `upgrade_binary` is a deliberate exception — it bypasses the inner-handler
+/// check and goes straight to the upgrade coordinator. Sidecar self-upgrade
+/// must work even when the chassis is unreachable, otherwise an operator
+/// can't ship a fix to a sidecar whose target is offline.
 pub struct DeferredAppearXHandler {
     inner: RwLock<Option<Arc<AppearXCommandHandler>>>,
+    /// Cloned-from-startup. Same `Option<Arc<UpgradeCoordinator>>` as the
+    /// inner real handler so `upgrade_binary` works pre- and post-discovery.
+    upgrade_coord: Option<Arc<UpgradeCoordinator>>,
 }
 
 impl DeferredAppearXHandler {
-    pub fn new() -> Self {
+    pub fn new(upgrade_coord: Option<Arc<UpgradeCoordinator>>) -> Self {
         Self {
             inner: RwLock::new(None),
+            upgrade_coord,
         }
     }
 
@@ -94,12 +120,6 @@ impl DeferredAppearXHandler {
     }
 }
 
-impl Default for DeferredAppearXHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl CommandHandler for DeferredAppearXHandler {
     async fn handle_command(
@@ -107,6 +127,12 @@ impl CommandHandler for DeferredAppearXHandler {
         command_id: String,
         action: Value,
     ) -> Result<Value, CommandError> {
+        // Sidecar self-upgrade bypasses the inner-handler gate so a
+        // chassis-down event doesn't lock operators out of fixing a
+        // sidecar bug.
+        if action.get("type").and_then(|t| t.as_str()) == Some("upgrade_binary") {
+            return dispatch_upgrade_binary(&self.upgrade_coord, &action).await;
+        }
         let h = self.inner.read().await.clone();
         match h {
             Some(h) => h.handle_command(command_id, action).await,
@@ -620,6 +646,19 @@ impl CommandHandler for AppearXCommandHandler {
                     .map_err(vendor_error)
             }
 
+            // ── Remote binary upgrade ──
+            //
+            // Same surface as `bilbycast-edge`'s `upgrade_binary` arm. Fully
+            // implemented inside the SDK's `UpgradeCoordinator`; this handler
+            // just validates the action shape and on success queues the
+            // exit-after-drain so systemd respawns into the new binary via
+            // the `current/` symlink.
+            //
+            // Routed via `dispatch_upgrade_binary` so the deferred handler
+            // and the real handler share one implementation — sidecar
+            // self-upgrade must work even when the chassis is unreachable.
+            "upgrade_binary" => dispatch_upgrade_binary(&self.upgrade_coord, &action).await,
+
             other => Err(CommandError::unknown_action(other)),
         }
     }
@@ -649,6 +688,77 @@ fn require_ipgw(
     state
         .discovered_version(slot, "ipGateway", module)
         .ok_or_else(|| unsupported_on_card(slot, action_name, &format!("ipGateway/{module}")))
+}
+
+/// Dispatch `{type: "upgrade_binary", version, channel, target_arch?, variant?}`.
+///
+/// Mirrors the edge's `manager/client.rs::execute_command` arm at line 3406
+/// but parameterised through the SDK's `UpgradeCoordinator`. The helper
+/// runs in two phases:
+///
+/// 1. Validate the action shape (mandatory `version` + `channel`, optional
+///    `target_arch` + `variant`). Mandatory-field errors lift onto
+///    `command_ack.error_code` so the manager UI can target a specific
+///    form field.
+/// 2. Call `coord.stage(...)`. On success, schedule a 5 s drain then
+///    `std::process::exit(0)` so systemd respawns into the staged
+///    binary via the `current/` symlink. The ack is returned before the
+///    exit fires (the deferred ack races the exit; tokio resolves the
+///    ack first ~99 % of the time, and the manager treats a missed ack
+///    the same way — the new gateway re-authenticates with the new
+///    `software_version` on its first beat after respawn).
+///
+/// Shared between [`DeferredAppearXHandler`] (sidecar self-upgrade
+/// works pre-discovery) and [`AppearXCommandHandler`] (post-discovery).
+async fn dispatch_upgrade_binary(
+    upgrade_coord: &Option<Arc<UpgradeCoordinator>>,
+    action: &Value,
+) -> Result<Value, CommandError> {
+    let coord = upgrade_coord.as_ref().ok_or_else(|| {
+        CommandError::new(
+            upgrade_error_codes::UPGRADE_DISABLED,
+            "remote upgrades not configured on this gateway — add an [upgrade] section to config.toml",
+        )
+    })?;
+    let version = action.get("version").and_then(|v| v.as_str()).ok_or_else(|| {
+        CommandError::new(
+            upgrade_error_codes::UPGRADE_VERSION_INVALID,
+            "upgrade_binary: missing 'version'",
+        )
+    })?;
+    let channel = action.get("channel").and_then(|v| v.as_str()).ok_or_else(|| {
+        CommandError::new(
+            upgrade_error_codes::UPGRADE_CHANNEL_NOT_ALLOWED,
+            "upgrade_binary: missing 'channel'",
+        )
+    })?;
+    let target_arch = action.get("target_arch").and_then(|v| v.as_str());
+    let variant = action.get("variant").and_then(|v| v.as_str());
+
+    let staged = coord
+        .stage(version, channel, target_arch, variant)
+        .await
+        .map_err(|e| CommandError::new(e.code, e.message))?;
+
+    let from_v = staged.from_version.clone();
+    let to_v = staged.to_version.clone();
+    tokio::spawn(async move {
+        info!("upgrade staged ({from_v} → {to_v}); draining in 5 s before respawn");
+        // 5 s drain so the WS write task flushes the ack we returned
+        // below and any in-flight JSON-RPC call to the chassis can
+        // complete its response handler.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        std::process::exit(0);
+    });
+
+    Ok(json!({
+        "status": "staged",
+        "from_version": staged.from_version,
+        "to_version": staged.to_version,
+        "channel": staged.channel,
+        "variant": staged.variant,
+        "arch": staged.arch,
+    }))
 }
 
 /// Build the canonical "this slot's card family doesn't expose the required

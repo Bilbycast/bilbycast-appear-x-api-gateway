@@ -222,6 +222,19 @@ deltas that matter for this sidecar:
   operator tooling; the gateway reconnects after the manager
   restarts as usual.
 
+## Remote upgrade
+
+The gateway accepts `upgrade_binary` WS commands from the manager and stages a Sigstore-verified release tarball, atomically swaps the `current` symlink under `/opt/bilbycast/appear-x-gateway/`, then drains and exits for systemd respawn. A boot watchdog guarantees a failed upgrade rolls back automatically. Mirrors the edge's upgrade pattern; the heavy lifting lives in `bilbycast-gateway-sdk::upgrade`, parameterised by [`src/upgrade_profile.rs`](src/upgrade_profile.rs).
+
+- **Coordinator wiring**: `main.rs` builds an `Option<Arc<UpgradeCoordinator>>` from `cfg.upgrade`, runs `run_boot_watchdog` *before* the WS connect (so a crash-loop on the new binary triggers symlink revert + `exit(1)` on the (`max_boot_attempts` + 1)th boot), spawns an event-forwarder task that drains `mpsc::Receiver<UpgradeEvent>` onto the SDK `Emitter`, spawns the periodic watchdog (promotes `pending_health → stable` after `boot_health_window_secs`), and runs a 15 s healthy-beat ticker.
+- **Command arm**: `appear_x::commands::dispatch_upgrade_binary` validates the action shape, calls `coord.stage(version, channel, target_arch?, variant?)`, and on success schedules a 5 s drain then `std::process::exit(0)` so systemd respawns into `current/`. **Both** the `DeferredAppearXHandler` (pre-discovery) and the `AppearXCommandHandler` (post-discovery) route the arm — sidecar self-upgrade must work even when the chassis is unreachable.
+- **Capability advertisement**: `"upgrade"` is added to every health envelope's `capabilities` array unconditionally — the SDK upgrade module is always compiled in, mirroring the edge's baseline. The manager UI is device-type-agnostic and gates the per-node Upgrade button on this capability, so appear_x lights up by default. When the operator hasn't wired `[upgrade]` in `config.toml`, `dispatch_upgrade_binary` safely refuses with `upgrade_disabled` and a pointer at the missing config; the button stays visible so operators can discover the feature.
+- **Identity allowlist**: [`src/upgrade_profile.rs`](src/upgrade_profile.rs) pins the repo + workflow path `Bilbycast/bilbycast-appear-x-api-gateway/.github/workflows/nightly-release.yml` against `refs/tags/v*`. Sigstore Fulcio cert identity must match — supply-chain compromise of any other CI workflow cannot stage a binary.
+- **On-disk layout**: `/opt/bilbycast/appear-x-gateway/{current → versions/<v>/, versions/, state.json, config.toml, credentials.json}`. Service account `bilbycast-gateway` (NOT `bilbycast`, which is the edge's user — they coexist on the same host with separate filesystem permissions).
+- **Operator install bundle**: [`packaging/install-appear-x-gateway.sh`](packaging/install-appear-x-gateway.sh) (curl-pipe-bash with cosign verify-blob), [`packaging/bilbycast-appear-x-gateway.service`](packaging/bilbycast-appear-x-gateway.service), [`packaging/bilbycast-appear-x-gateway.sysusers`](packaging/bilbycast-appear-x-gateway.sysusers), [`packaging/uninstall-appear-x-gateway.sh`](packaging/uninstall-appear-x-gateway.sh).
+- **Release pipeline**: tarballs + cosign-signed `manifest.json` published by `.github/workflows/nightly-release.yml` (tag-push trigger on `vX.Y.Z`). Uses the SDK's shared `bilbycast-gateway-sdk/scripts/build-manifest.sh`. Self-verify step catches workflow-path / allowlist mismatch before publishing.
+- **Vendor parity**: `bilbycast-gateway-template` and `bilbycast-gateway-sdk/docs/writing-a-gateway.md` §9a + §9b document the same wiring for new vendor sidecars.
+
 ## Appear X Platform Reference
 
 The Appear X platform uses:

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LicenseRef-Proprietary
 
 use anyhow::{Context, Result};
+use bilbycast_gateway_sdk::UpgradeConfig;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -10,6 +11,16 @@ pub struct AppConfig {
     pub manager: ManagerConfig,
     pub appear_x: AppearXConfig,
     pub polling: PollingConfig,
+    /// Optional `[upgrade]` section. When present, the gateway accepts
+    /// `upgrade_binary` WS commands from the manager and stages a
+    /// Sigstore-verified release tarball into `install_root/versions/<v>/`,
+    /// then exits for systemd respawn. The boot watchdog rolls back
+    /// automatically on failure. Mirrors the edge's `upgrades` block.
+    ///
+    /// Re-uses the SDK's [`UpgradeConfig`] so every gateway sidecar
+    /// shares the same TOML shape.
+    #[serde(default)]
+    pub upgrade: Option<UpgradeConfig>,
 }
 
 /// Operator-facing `[manager]` section of the gateway's TOML config.
@@ -199,6 +210,32 @@ impl AppConfig {
             // manager-side pin so the formats stay symmetric.
             bilbycast_gateway_sdk::tls::normalise_fingerprint(fp)
                 .map_err(|e| anyhow::anyhow!("appear_x.cert_fingerprint: {}", e))?;
+        }
+
+        // Validate `[upgrade]` if present. The SDK validates allowed_channels
+        // / min_version / install_root semantically inside `UpgradeCoordinator::stage`,
+        // but a bad install_root path is much friendlier to surface here at
+        // load time rather than only on the first staged upgrade.
+        if let Some(ref up) = config.upgrade {
+            if up.allowed_channels.is_empty() {
+                anyhow::bail!(
+                    "upgrade.allowed_channels must contain at least one channel \
+                     (typical: [\"stable\"])"
+                );
+            }
+            for ch in &up.allowed_channels {
+                if !ch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    anyhow::bail!(
+                        "upgrade.allowed_channels[{ch:?}] must be alphanumeric / dash / underscore"
+                    );
+                }
+            }
+            if !up.install_root.is_absolute() {
+                anyhow::bail!(
+                    "upgrade.install_root must be an absolute path (got {:?})",
+                    up.install_root
+                );
+            }
         }
 
         Ok(config)

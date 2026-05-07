@@ -1,0 +1,3 @@
+# systemd-sysusers config for the bilbycast-appear-x-gateway service account.
+# Drop into /etc/sysusers.d/ during install.
+u bilbycast-gateway - "bilbycast gateway sidecar service account" /var/lib/bilbycast/appear-x-gateway /usr/sbin/nologin

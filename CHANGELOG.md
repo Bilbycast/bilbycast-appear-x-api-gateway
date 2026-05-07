@@ -6,6 +6,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Release workflow triggers** — `push.tags: v*` and `workflow_dispatch`
+  added alongside the existing nightly cron. The new monorepo-root
+  `release-all.sh` orchestrator detects Cargo.toml version bumps and pushes
+  matching tags for on-demand releases; the nightly cron stays as a safety
+  net. Workflow filename is preserved (`nightly-release.yml`) because it
+  is hard-coded into `src/upgrade_profile.rs::ALLOWED_SIGNERS` and the
+  cosign self-verify regex — renaming would lock every deployed gateway
+  out of accepting new signed manifests. Manual install URL and the
+  manager-driven auto-upgrade pipeline are unchanged.
+
+### Added — remote upgrade
+
+Remote, manager-driven binary upgrade — same Sigstore-keyless trust
+chain the edge uses, parameterised through `bilbycast_gateway_sdk::upgrade`.
+Operators can now ship a sidecar fix from the manager UI without SSHing
+to every host running an Appear X chassis bridge.
+
+- New `[upgrade]` TOML section (re-exports the SDK's `UpgradeConfig`
+  shape) — `enabled`, `allowed_channels`, `install_root`, `min_version`,
+  `boot_health_window_secs`, `max_boot_attempts`. Validation runs at
+  load time for early operator feedback.
+- New `src/upgrade_profile.rs` with the gateway's `ALLOWED_SIGNERS`
+  identity allowlist and `UpgradeProfile` const pinning the repo +
+  binary name + workflow path. The release workflow's path appears
+  here verbatim — supply-chain compromise of any other CI workflow
+  cannot stage a binary.
+- `main.rs` wires the boot watchdog (runs before the WS connect so a
+  crash-loop on the new binary triggers symlink revert), the
+  coordinator, an event-forwarder task that drains
+  `tokio::mpsc::Receiver<UpgradeEvent>` into the SDK Emitter, the
+  periodic watchdog (promotes `pending_health → stable`), and a 15 s
+  healthy-beat ticker.
+- `appear_x/commands.rs::dispatch_upgrade_binary` arm — validates
+  action shape, calls `coord.stage(...)`, on success schedules a
+  5 s drain then `std::process::exit(0)` so systemd respawns into
+  `current/`. Routed through both `DeferredAppearXHandler` (sidecar
+  self-upgrade works pre-discovery) and `AppearXCommandHandler`
+  (post-discovery) so a chassis-down event doesn't lock operators
+  out of fixing a sidecar bug.
+- `"upgrade"` capability advertised on every health envelope when
+  `[upgrade]` is wired in TOML. The manager UI gates the per-node
+  Upgrade button on this capability (the manager logic is
+  device-type-agnostic; appear_x lights up automatically).
+- New `packaging/` directory:
+  - `install-appear-x-gateway.sh` — curl-pipe-bash installer with
+    cosign verify-blob, manifest pinning, atomic symlink layout,
+    `bilbycast-gateway` system user, systemd enable + health poll.
+  - `uninstall-appear-x-gateway.sh` with optional `--purge-config` /
+    `--purge-user`.
+  - `bilbycast-appear-x-gateway.service` — hardened systemd unit
+    (`ProtectSystem=strict`, no `CapabilityBoundingSet`, no `/dev`
+    device allow-list — sidecars don't touch the GPU or audio).
+  - `bilbycast-appear-x-gateway.sysusers` for `systemd-sysusers`.
+- Release workflow rewritten to ship tarballs (binary + LICENSE +
+  README + packaging/), generate `manifest.json` via the SDK's shared
+  `scripts/build-manifest.sh`, sign with `cosign sign-blob --bundle`,
+  paranoid self-verify against the production identity regex, and
+  publish the manifest + bundle alongside the tarballs and standalone
+  install scripts. Tag-push trigger added so maintainers can cut a
+  release with `git tag vX.Y.Z`. `id-token: write` permission added
+  for Sigstore Fulcio.
+
+### Added — Xger card-manager surface
+
 Rebuilt the X5 / X10 / X20 monitoring and configuration surface around the
 `Xger` card-manager interface after live-probing an X20_2RU + X5 HEVC SDI
 unit revealed the existing `Xger:*/coderService/GetCoderServices` probe

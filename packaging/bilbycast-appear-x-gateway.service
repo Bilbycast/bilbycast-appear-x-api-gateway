@@ -1,0 +1,61 @@
+[Unit]
+Description=bilbycast Appear X API gateway sidecar
+Documentation=https://bilbycast.com/docs https://github.com/Bilbycast/bilbycast-appear-x-api-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bilbycast-gateway
+Group=bilbycast-gateway
+
+# `current` is a symlink the upgrade pipeline atomically swaps; systemd
+# follows it on every (re)start so a successful staged upgrade lands the
+# moment the old binary exits.
+ExecStart=/opt/bilbycast/appear-x-gateway/current/bilbycast-appear-x-api-gateway --config /opt/bilbycast/appear-x-gateway/config.toml
+
+# Restart on any non-zero exit so the boot watchdog can drive the
+# rollback handshake. 3-second back-off is plenty — typical respawn
+# latency is dominated by systemd's own settling, not the binary.
+Restart=always
+RestartSec=3
+# Limit how often we'll respawn; pairs with the watchdog's
+# `max_boot_attempts` so a crash-loop on a bad upgrade doesn't burn
+# CPU forever before the symlink revert kicks in.
+StartLimitInterval=300
+StartLimitBurst=10
+
+# Send SIGTERM and let the gateway drain in-flight JSON-RPC calls
+# and close sockets cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ── Hardening ──
+ProtectSystem=strict
+# Writable paths: the install root (versions/, current symlink, state.json,
+# credentials.json), and the runtime tmp dir. Everything else is read-only.
+ReadWritePaths=/opt/bilbycast/appear-x-gateway /var/lib/bilbycast/appear-x-gateway /run/bilbycast
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# No /dev/dri or /dev/snd — sidecars don't touch the GPU or audio
+# hardware. Only the manager-WS link + the JSON-RPC HTTPS link to the
+# Appear X chassis.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Resource limits. The gateway is light — 1 GB RSS is generous and
+# leaves headroom for tar+flate2 during a staged upgrade.
+LimitNOFILE=4096
+MemoryMax=1G
+
+# Environment file lets operators set RUST_LOG, BILBYCAST_ALLOW_INSECURE,
+# etc. without editing the unit. Created blank by install-appear-x-gateway.sh.
+EnvironmentFile=-/etc/bilbycast/appear-x-gateway.env
+
+[Install]
+WantedBy=multi-user.target
