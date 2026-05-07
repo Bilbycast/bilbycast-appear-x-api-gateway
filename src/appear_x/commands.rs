@@ -231,6 +231,78 @@ impl CommandHandler for AppearXCommandHandler {
                     .await
                     .map_err(vendor_error)
             }
+
+            // ── Phase B: on-demand live status fetches ──
+            //
+            // The polling engine maintains a 5-second consolidated view of
+            // these surfaces, but on-demand commands let the manager fetch
+            // a fresh snapshot for ad-hoc dashboards (network diagnostics,
+            // SRT troubleshooting). Same per-slot gating as the other
+            // ipGateway commands — a card with no `status` module returns
+            // `unsupported_on_card` instead of leaking a vendor RPC error.
+            "get_ip_input_status" => {
+                let ver = require_ipgw(&self.state, slot, "status", "get_ip_input_status")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/status/GetIpInputStatus"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_ip_output_status" => {
+                let ver = require_ipgw(&self.state, slot, "status", "get_ip_output_status")?;
+                let primary = format!("ipGateway:{ver}/status/GetIpOutputStatus");
+                let fallback = format!("ipGateway:{ver}/status/GetOutputStatus");
+                match self.client.call_board(slot, &primary, json!({})).await {
+                    Ok(r) => Ok(r),
+                    Err(e) if format!("{e:#}").contains("not found") => {
+                        self.client.call_board(slot, &fallback, json!({})).await.map_err(vendor_error)
+                    }
+                    Err(e) => Err(vendor_error(e)),
+                }
+            }
+            "get_srt_input_status" => {
+                let ver = require_ipgw(&self.state, slot, "status", "get_srt_input_status")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/status/GetSrtInputStatus"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_srt_output_status" => {
+                let ver = require_ipgw(&self.state, slot, "status", "get_srt_output_status")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/status/GetSrtOutputStatus"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_pid_status" => {
+                // Per-PID drill-down; on-demand only because the response can
+                // be large for SPTS/MPTS inputs with many elementary streams.
+                let ver = require_ipgw(&self.state, slot, "status", "get_pid_status")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/status/GetPidStatus"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_physical_ports" => {
+                let ver = require_ipgw(&self.state, slot, "physicalports", "get_physical_ports")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/physicalports/GetPhysicalPorts"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_virtual_ports" => {
+                let ver = require_ipgw(&self.state, slot, "physicalports", "get_virtual_ports")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/physicalports/GetVirtualPorts"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_triggers" => {
+                let ver = require_ipgw(&self.state, slot, "triggers", "get_triggers")?;
+                self.client
+                    .call_board(slot, &format!("ipGateway:{ver}/triggers/GetTriggers"), json!({}))
+                    .await
+                    .map_err(vendor_error)
+            }
             "set_ip_input" => {
                 let ver = require_ipgw(&self.state, slot, "input", "set_ip_input")?;
                 let inputs = require_field(&action, "inputs")?;
@@ -280,6 +352,158 @@ impl CommandHandler for AppearXCommandHandler {
                 )
                 .await
                 .map_err(vendor_error),
+
+            // ── Phase D: actionable alarms ──
+            //
+            // History fetch is on-demand only. The chassis returns a long
+            // list (every alarm raise + clear since last `ClearAlarmsHistory`),
+            // so the manager UI fires this when an operator opens "Alarm
+            // history" and forwards `since` (RFC3339 timestamp) + `limit` to
+            // the chassis. Optional params pass through; absent params query
+            // the full window.
+            "get_alarm_history" => {
+                let mut q = json!({});
+                if let Some(o) = action.as_object() {
+                    if let Some(since) = o.get("since") { q["since"] = since.clone(); }
+                    if let Some(limit) = o.get("limit") { q["limit"] = limit.clone(); }
+                    if let Some(sev) = o.get("severityFilter") { q["severityFilter"] = sev.clone(); }
+                }
+                self.client
+                    .call_mmi(
+                        &format!("mmi:{}/alarms/GetAlarmsHistory", self.mmi.alarms),
+                        json!({"query": q}),
+                    )
+                    .await
+                    .map_err(vendor_error)
+            }
+            "get_registered_alarms" => self
+                .client
+                .call_mmi(
+                    &format!("mmi:{}/alarms/GetRegisteredAlarms", self.mmi.alarms),
+                    json!({}),
+                )
+                .await
+                .map_err(vendor_error),
+            "get_all_alarm_overrides" => self
+                .client
+                .call_mmi(
+                    &format!("mmi:{}/alarms/GetAllAlarmOverrides", self.mmi.alarms),
+                    json!({}),
+                )
+                .await
+                .map_err(vendor_error),
+            // Phase E: alarm-override editor.
+            //
+            // SetAlarmOverrides accepts an array of overrides keyed by
+            // (alarmId, severity?, configObjectId?). The manager UI sends
+            // `{overrides: [...]}` pre-shaped per the §2.2.7 schema; this
+            // arm just forwards. Overrides let an operator hush a chronic
+            // noise source or escalate a low-severity trigger to MAJOR.
+            "set_alarm_overrides" => {
+                let overrides = action.get("overrides").cloned().ok_or_else(|| {
+                    CommandError::validation("missing 'overrides' field")
+                })?;
+                self.client
+                    .call_mmi(
+                        &format!("mmi:{}/alarms/SetAlarmOverrides", self.mmi.alarms),
+                        json!({"overrides": overrides}),
+                    )
+                    .await
+                    .map_err(vendor_error)
+            }
+            "delete_alarm_overrides" => {
+                let ids = action.get("ids").cloned().ok_or_else(|| {
+                    CommandError::validation("missing 'ids' field")
+                })?;
+                self.client
+                    .call_mmi(
+                        &format!("mmi:{}/alarms/DeleteAlarmOverrides", self.mmi.alarms),
+                        json!({"ids": ids}),
+                    )
+                    .await
+                    .map_err(vendor_error)
+            }
+
+            // ── Phase F: TimeX (PTP + system time) ──
+            //
+            // Per-slot read/write surface. Only present on chassis that
+            // load the TimeX module — bare X5 HEVC SDI 1.0.2 doesn't, in
+            // which case `discovered_version` returns None and we surface
+            // an `unsupported_on_card` error instead of leaking a vendor
+            // RPC failure. Settings are written through wholesale (the
+            // operator pastes their PtpSettings struct) — the schema is
+            // the canonical X Platform 1.0.x type.
+            "get_ptp_status" => timex_call(&self.client, &self.state, slot,
+                "cardPtp", "GetPtpStatus", json!({})).await,
+            "get_ptp_settings" => timex_call(&self.client, &self.state, slot,
+                "cardPtp", "GetPtpSettings", json!({})).await,
+            "set_ptp_settings" => {
+                let settings = action.get("settings").cloned().ok_or_else(|| {
+                    CommandError::validation("missing 'settings' field")
+                })?;
+                timex_call(&self.client, &self.state, slot,
+                    "cardPtp", "SetPtpSettings", json!({"settings": settings})).await
+            }
+            "get_card_ptp_capabilities" => timex_call(&self.client, &self.state, slot,
+                "cardPtp", "GetCardPtpCapabilities", json!({})).await,
+            "get_system_time_status" => timex_call(&self.client, &self.state, slot,
+                "systemTimeSettings", "GetSystemTimeStatus", json!({})).await,
+            "get_system_time_settings" => timex_call(&self.client, &self.state, slot,
+                "systemTimeSettings", "GetSystemTimeSettings", json!({})).await,
+            "set_system_time_settings" => {
+                let settings = action.get("settings").cloned().ok_or_else(|| {
+                    CommandError::validation("missing 'settings' field")
+                })?;
+                timex_call(&self.client, &self.state, slot,
+                    "systemTimeSettings", "SetSystemTimeSettings", json!({"settings": settings})).await
+            }
+            "get_current_utc_time" => timex_call(&self.client, &self.state, slot,
+                "systemTimeSettings", "GetCurrentUtcTime", json!({})).await,
+
+            // ── Phase F: license (MMI module 15) ──
+            //
+            // No state poller — operators look at licensing infrequently
+            // (license install / annual renewal). Surface as on-demand
+            // commands. Uses the chassis-MMI version threaded in via
+            // `MmiVersions::chassis` rather than a dedicated config knob,
+            // because license/hardware are documented under the same
+            // mmi envelope as chassisModel.
+            "get_features_info" => self
+                .client
+                .call_mmi(
+                    &format!("mmi:{}/license/GetFeaturesInfo", self.mmi.chassis),
+                    json!({}),
+                )
+                .await
+                .map_err(vendor_error),
+            "get_license" => self
+                .client
+                .call_mmi(
+                    &format!("mmi:{}/license/GetLicense", self.mmi.chassis),
+                    json!({}),
+                )
+                .await
+                .map_err(vendor_error),
+            "get_hardware_id" => self
+                .client
+                .call_mmi(
+                    &format!("mmi:{}/license/GetHardwareId", self.mmi.chassis),
+                    json!({}),
+                )
+                .await
+                .map_err(vendor_error),
+            "install_license" => {
+                let key = action.get("license").cloned().ok_or_else(|| {
+                    CommandError::validation("missing 'license' field (license blob from vendor)")
+                })?;
+                self.client
+                    .call_mmi(
+                        &format!("mmi:{}/license/InstallLicense", self.mmi.chassis),
+                        json!({"license": key}),
+                    )
+                    .await
+                    .map_err(vendor_error)
+            }
             "get_chassis" => self
                 .client
                 .call_mmi(
@@ -777,6 +1001,31 @@ fn unsupported_on_card(slot: u32, action: &str, iface_module: &str) -> CommandEr
              IP Gateway board (ME-3000 / ME-4000)."
         ),
     )
+}
+
+/// Phase F: TimeX module router. Mirrors `xger_call` but for the
+/// `TimeX:*` interface. Gated on per-slot discovery — `cardPtp` and
+/// `systemTimeSettings` are loaded together on chassis that support
+/// chassis-side timing (X10 / X20 with 2110 encoders, some commissioned
+/// X5 variants), absent on bare X5 HEVC SDI. Returns
+/// `unsupported_on_card` rather than a raw "Method not found" so the
+/// manager UI can hide the timing tab cleanly.
+async fn timex_call(
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    slot: u32,
+    module: &str,
+    command: &str,
+    params: Value,
+) -> Result<Value, CommandError> {
+    let action_name = command_to_action(command);
+    let ver = state
+        .discovered_version(slot, "TimeX", module)
+        .ok_or_else(|| unsupported_on_card(slot, &action_name, &format!("TimeX/{module}")))?;
+    client
+        .call_board(slot, &format!("TimeX:{ver}/{module}/{command}"), params)
+        .await
+        .map_err(vendor_error)
 }
 
 /// Resolve the Xger interface version for a specific module. Strict — if

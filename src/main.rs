@@ -1,6 +1,12 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: LicenseRef-Proprietary
 
+// `serde_json::json!({...})` expansion in the snapshot path now exceeds the
+// default recursion limit because the consolidated stats payload carries
+// 30+ fields. Bumping crate-wide is cheaper than refactoring into multiple
+// `Map::insert` calls and preserves the readability of the snapshot literal.
+#![recursion_limit = "256"]
+
 //! bilbycast-appear-x-api-gateway — bridges Appear X JSON-RPC API to bilbycast-manager.
 //!
 //! This gateway connects to bilbycast-manager as a WebSocket client (same protocol
@@ -317,7 +323,15 @@ async fn main() -> Result<()> {
     let discovery_phase_for_loop = discovery_phase.clone();
     tokio::spawn(async move {
         info!("Running Appear X capability discovery in background…");
-        let cards_mmi_versions = ["2.8", "2.16", "4.1", "1.0"];
+        // MMI envelope versions to probe for `cards/GetChassisInfo`. Newest
+    // first so a current X Platform 1.0.x firmware (mmi:5.6) is identified
+    // promptly rather than locking in to an older compatibility-mode
+    // response from `mmi:2.8`. The chassis is tolerant — most modern
+    // firmware accepts the entire range — but the version that wins gets
+    // threaded into every subsequent `mmi:*/cards/*` call, so picking the
+    // freshest one keeps us aligned with the firmware revision the
+    // operator is actually running.
+    let cards_mmi_versions = ["5.6", "5.0", "4.1", "4.0", "2.16", "2.8", "1.0"];
         let retry_delay = std::time::Duration::from_secs(5);
         let mut attempt: u32 = 0;
         let caps = loop {
@@ -541,7 +555,15 @@ async fn run_probe(cfg: &config::AppConfig) -> Result<()> {
     // the universe down to "the things this card software actually supports".
     println!();
     println!("Discovering per-slot card interfaces…");
-    let cards_mmi_versions = ["2.8", "2.16", "4.1", "1.0"];
+    // MMI envelope versions to probe for `cards/GetChassisInfo`. Newest
+    // first so a current X Platform 1.0.x firmware (mmi:5.6) is identified
+    // promptly rather than locking in to an older compatibility-mode
+    // response from `mmi:2.8`. The chassis is tolerant — most modern
+    // firmware accepts the entire range — but the version that wins gets
+    // threaded into every subsequent `mmi:*/cards/*` call, so picking the
+    // freshest one keeps us aligned with the firmware revision the
+    // operator is actually running.
+    let cards_mmi_versions = ["5.6", "5.0", "4.1", "4.0", "2.16", "2.8", "1.0"];
     let caps = match appear_x::capabilities::discover(&client, &cards_mmi_versions).await {
         Ok(c) => c,
         Err(e) => {

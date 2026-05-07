@@ -42,6 +42,11 @@ chassis_interval_secs = 30
 inputs_interval_secs = 15
 outputs_interval_secs = 15
 cards_interval_secs = 30
+# Periodic re-emission of every currently-active alarm as a fresh `alarm`
+# event, in seconds. Without this, chronic alarms emit one event on first
+# observation and never again — leaving the manager events page empty for
+# stable-but-broken chassis. Default 30 minutes; 0 disables.
+alarms_refresh_interval_secs = 1800
 
 # MMI interface versions for the chassis-level endpoints. These vary across
 # Appear firmware versions; the gateway logs "Method '...' was not found" if

@@ -70,7 +70,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "ipGateway",
         module: "input",
         command: "GetInputs",
-        versions: &["1.20", "1.16", "1.15", "1.14", "1.10"],
+        versions: &["1.57", "1.39", "1.20", "1.16", "1.15", "1.14", "1.10"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -78,7 +78,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "ipGateway",
         module: "output",
         command: "GetOutputs",
-        versions: &["1.20", "1.16", "1.15", "1.14", "1.10"],
+        versions: &["1.57", "1.39", "1.20", "1.16", "1.15", "1.14", "1.10"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -86,7 +86,63 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "ipGateway",
         module: "ipinterface",
         command: "GetIpInterfaces",
-        versions: &["1.20", "1.16", "1.15", "1.14", "1.10"],
+        versions: &["1.57", "1.39", "1.20", "1.16", "1.15", "1.14", "1.10"],
+        params: ProbeParams::Empty,
+    },
+    // Phase B: live telemetry. The `status` module returns measured bitrates,
+    // per-input RTP / continuity-counter / sync-byte / TEI errors, and SRT
+    // peer state. Fast-polled (≤ 5 s) so the manager dashboard reflects
+    // signal flow within a refresh cycle.
+    ProbeEntry {
+        family: "ipGateway",
+        interface: "ipGateway",
+        module: "status",
+        command: "GetIpInputStatus",
+        versions: &["1.57", "1.39", "1.25", "1.20", "1.15"],
+        params: ProbeParams::Empty,
+    },
+    // `physicalports` — per-port mode (SFP/RJ45), link rate, FEC, LLDP,
+    // SFP optical metrics. Slow inventory poll. Distinct from the X10/X20
+    // Xger-side `ipInterface` (which is a *logical* interface; this is the
+    // physical port underneath it).
+    ProbeEntry {
+        family: "ipGateway",
+        interface: "ipGateway",
+        module: "physicalports",
+        command: "GetPhysicalPorts",
+        versions: &["1.57", "1.39", "1.16"],
+        params: ProbeParams::Empty,
+    },
+    // `triggers` — alarm trigger config (which alarms are armed per card).
+    // Read-only here; write surface lives via `mmi:*/alarms/SetAlarmOverrides`
+    // for severity and hush, which is broader than per-card triggers.
+    ProbeEntry {
+        family: "ipGateway",
+        interface: "ipGateway",
+        module: "triggers",
+        command: "GetTriggers",
+        versions: &["1.57", "1.39", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    // Phase F: TimeX precision-timing surface. Loaded on chassis families
+    // that own a card-side PTP / system-time configuration (X10/X20 with
+    // 2110 encoders; some commissioned X5 variants). Bare X5 HEVC SDI
+    // 1.0.2 doesn't expose it — the probe quietly gives up and the
+    // manager UI hides the timing tab.
+    ProbeEntry {
+        family: "TimeX",
+        interface: "TimeX",
+        module: "cardPtp",
+        command: "GetPtpStatus",
+        versions: &["1.1", "1.0"],
+        params: ProbeParams::Empty,
+    },
+    ProbeEntry {
+        family: "TimeX",
+        interface: "TimeX",
+        module: "systemTimeSettings",
+        command: "GetSystemTimeStatus",
+        versions: &["1.5", "1.0"],
         params: ProbeParams::Empty,
     },
     // ── Cross-board services module (board:*/services/*). Lives under the
@@ -115,7 +171,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "cardStatus",
         command: "GetCardStatus",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.44"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49", "2.44"],
         params: ProbeParams::Slot,
     },
     ProbeEntry {
@@ -123,7 +179,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "cardAllocation",
         command: "GetCardAllocations",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -131,7 +187,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "multiService",
         command: "GetMultiServices",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.16"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49", "2.16"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -139,7 +195,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "audioProfile",
         command: "GetAudioProfiles",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.6"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49", "2.7", "2.6"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -147,7 +203,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "ipInterface",
         command: "GetIpInterfaces",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -155,7 +211,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "imageUpload",
         command: "GetImages",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -163,7 +219,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "poolConfig",
         command: "GetPoolConfig",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     // `coderService` / `ipConnection` / `lockStatus` are present on fully
@@ -175,7 +231,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "coderService",
         command: "GetCoderServices",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49", "2.44", "2.40"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49", "2.47", "2.44", "2.40"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -183,7 +239,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "ipConnection",
         command: "GetIpConnections",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     // Phase 2: ST 2022-7 / hot-standby redundancy groups. Configured via
@@ -195,7 +251,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "redundancyGroup",
         command: "GetRedundancyGroups",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -203,7 +259,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "redundancyGroupStatus",
         command: "GetRedundancyGroupStatus",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -211,7 +267,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "lockStatus",
         command: "GetLockStatus",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -219,7 +275,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "psiStatus",
         command: "GetPsiStatus",
-        versions: &["2.55", "2.54", "2.53", "2.52", "2.49"],
+        versions: &["2.58", "2.55", "2.54", "2.53", "2.52", "2.49"],
         params: ProbeParams::Empty,
     },
     // ── Pure-JPEG-XS encoder family (hipEnc reference). Modules use the
@@ -328,7 +384,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "dpi",
         command: "GetDpi",
-        versions: &["2.55", "2.54", "2.49", "1.0"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -336,7 +392,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "dpiStatus",
         command: "GetDpiStatus",
-        versions: &["2.55", "2.54", "2.49", "1.0"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -344,7 +400,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "esamConfig",
         command: "GetEsamConfig",
-        versions: &["2.55", "2.54", "2.49", "1.0"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -352,7 +408,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "esamStatus",
         command: "GetEsamStatus",
-        versions: &["2.55", "2.54", "2.49", "1.0"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -360,7 +416,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "scte35Config",
         command: "GetScte35Config",
-        versions: &["2.55", "2.54", "2.49", "1.1"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.1"],
         params: ProbeParams::Empty,
     },
     ProbeEntry {
@@ -368,7 +424,7 @@ pub const CARD_PROBES: &[ProbeEntry] = &[
         interface: "Xger",
         module: "poisServerStatus",
         command: "GetPoisServerStatus",
-        versions: &["2.55", "2.54", "2.49", "1.0"],
+        versions: &["2.58", "2.55", "2.54", "2.49", "1.0"],
         params: ProbeParams::Empty,
     },
     // ── SDI physical-card family (sdi reference; lowercase modules).

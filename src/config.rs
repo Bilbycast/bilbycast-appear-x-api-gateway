@@ -101,6 +101,17 @@ fn default_dwell_secs() -> u64 { 60 }
 pub struct PollingConfig {
     #[serde(default = "default_10")]
     pub alarms_interval_secs: u64,
+    /// Periodic re-emission window for active alarm events, in seconds.
+    /// Chronic alarms emit one event per transition (raise / clear).
+    /// Without re-emission, a stable-but-broken chassis stops generating
+    /// events on the manager's events page after the first alarm raise.
+    /// Every `alarms_refresh_interval_secs` the gateway force-clears its
+    /// "previously seen" alarm-id set so the next poll re-emits every
+    /// currently-active alarm as a fresh event. Default 1800 s
+    /// (30 minutes). Set to 0 to disable and revert to the legacy
+    /// raise-once-only behaviour.
+    #[serde(default = "default_alarms_refresh_interval_secs")]
+    pub alarms_refresh_interval_secs: u64,
     #[serde(default = "default_30")]
     pub chassis_interval_secs: u64,
     #[serde(default = "default_15")]
@@ -117,6 +128,18 @@ pub struct PollingConfig {
     /// MMI interface version used for `cards/*` calls (GetChassisInfo, GetCardStates).
     #[serde(default = "default_cards_mmi_version")]
     pub cards_mmi_version: String,
+    /// MMI interface version used for `uptime/GetSystemUptime`. The `uptime`
+    /// module appears in current X Platform 1.0.x firmware under the
+    /// `mmi:5.6` envelope (the module's own version is `1.0`, but the wire
+    /// method requires the envelope version). Older firmware doesn't expose
+    /// it; the poller treats "Method not found" as soft-fail.
+    #[serde(default = "default_uptime_mmi_version")]
+    pub uptime_mmi_version: String,
+    /// Polling interval (seconds) for `mmi:*/uptime/GetSystemUptime`. The
+    /// chassis's own uptime — distinct from the gateway sidecar's uptime.
+    /// Slow poll (60 s) — uptime increments by exactly the poll cadence.
+    #[serde(default = "default_60")]
+    pub uptime_interval_secs: u64,
     /// Polling interval (seconds) for `cards/GetChassisInfo` + `cards/GetCardStates`.
     #[serde(default = "default_30")]
     pub cards_interval_secs: u64,
@@ -152,10 +175,13 @@ pub struct PollingConfig {
 fn default_10() -> u64 { 10 }
 fn default_15() -> u64 { 15 }
 fn default_30() -> u64 { 30 }
+fn default_60() -> u64 { 60 }
 fn default_5() -> u64 { 5 }
 fn default_alarms_mmi_version() -> String { "2.8".into() }
 fn default_chassis_mmi_version() -> String { "4.1".into() }
 fn default_cards_mmi_version() -> String { "2.8".into() }
+fn default_uptime_mmi_version() -> String { "5.6".into() }
+fn default_alarms_refresh_interval_secs() -> u64 { 1800 }
 fn default_rx_threshold() -> f64 { -18.0 }
 fn default_temp_threshold() -> f64 { 70.0 }
 

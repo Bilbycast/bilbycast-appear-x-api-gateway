@@ -132,6 +132,25 @@ impl JsonRpcClient {
         self.call_rpc(&url, method, params).await
     }
 
+    /// Call an RPC method on an MMI-hosted service endpoint
+    /// (`/mmi/service_<name>/api/jsonrpc`). On X5 HEVC SDI firmware the
+    /// `service_encoderpool` and `service_decoderpool` endpoints host the
+    /// canonical `videoProfile` / `audioProfile` / `coderService` /
+    /// `testGeneratorProfile` modules — they are NOT reachable on the
+    /// per-slot `/board/<n>/` endpoint or on the chassis `/mmi/` root.
+    /// Service names are firmware-defined; pass them verbatim (e.g.
+    /// "encoderpool", "decoderpool"). Validation: name must be alpha-
+    /// numeric-with-underscore so a malformed config can't poison the URL.
+    pub async fn call_service(&self, service: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        if service.is_empty()
+            || !service.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            anyhow::bail!("Invalid service name {service:?} — must be alphanumeric or underscore");
+        }
+        let url = format!("{}/mmi/service_{}/api/jsonrpc", self.base_url, service);
+        self.call_rpc(&url, method, params).await
+    }
+
     async fn call_rpc(
         &self,
         url: &str,

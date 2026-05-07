@@ -94,6 +94,8 @@ pub async fn run_polling(
     spawn_alarms_poller(&client, &config, &state, &emitter, &event_gate, &identity, &cancel);
     spawn_chassis_poller(&client, &config, &state, &cancel);
     spawn_cards_poller(&client, &config, &state, &cancel);
+    spawn_uptime_poller(&client, &config, &state, &cancel);
+    spawn_pool_pollers(&client, &config, &state, &cancel);
 
     // Per-slot polling, gated by discovery. For each slot we walk the
     // discovered modules and only spawn pollers backed by modules this
@@ -177,6 +179,208 @@ pub async fn run_polling(
                 },
             );
         }
+        // ── Phase B: ipGateway live status surfaces ──
+        //
+        // `ipGateway:*/status/Get*` returns measured bitrates, RTP / CC /
+        // sync-byte / TEI errors per input, and SRT peer state. Fast-polled
+        // (default 5 s, same as cardStatus) so the dashboard reflects live
+        // signal flow inside one refresh cycle. Each Get* command shares the
+        // same `status` module — once discovery confirms the module, we
+        // spawn one task per Get* and route the result into the matching
+        // state slot. The four Get* names map to four separate state fields
+        // because the manager UI joins them to inputs/outputs/SRT-inputs/
+        // SRT-outputs by UUID independently.
+        if slot_caps.has_module("ipGateway", "status") {
+            let v = slot_caps
+                .module_version("ipGateway", "status")
+                .unwrap_or("1.57")
+                .to_string();
+            let fast = config.card_status_interval_secs;
+            // IP input live status (bitrates + errors).
+            let v_ipi = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                fast,
+                &format!("ipgw-ipinput-status-slot{slot}"),
+                move |c, st| {
+                    let v = v_ipi.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/status/GetIpInputStatus");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_ip_input_status(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+            // IP output live status. Two method names exist on different
+            // firmware (`GetIpOutputStatus` and `GetOutputStatus`) — try the
+            // newer name first, fall back to the generic on "Method not found".
+            let v_ipo = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                fast,
+                &format!("ipgw-ipoutput-status-slot{slot}"),
+                move |c, st| {
+                    let v = v_ipo.clone();
+                    Box::pin(async move {
+                        let primary = format!("ipGateway:{v}/status/GetIpOutputStatus");
+                        let fallback = format!("ipGateway:{v}/status/GetOutputStatus");
+                        let r = match c.call_board(slot, &primary, json!({})).await {
+                            Ok(r) => r,
+                            Err(e) if format!("{e:#}").contains("not found") => {
+                                c.call_board(slot, &fallback, json!({})).await?
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        st.set_ip_output_status(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+            // SRT input + output live status. Empty arrays on chassis with
+            // no SRT inputs/outputs configured.
+            let v_srti = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                fast,
+                &format!("ipgw-srt-input-status-slot{slot}"),
+                move |c, st| {
+                    let v = v_srti.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/status/GetSrtInputStatus");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_srt_input_status(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+            let v_srto = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                fast,
+                &format!("ipgw-srt-output-status-slot{slot}"),
+                move |c, st| {
+                    let v = v_srto.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/status/GetSrtOutputStatus");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_srt_output_status(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+        }
+
+        // Phase B: physical port inventory + virtual-port pairs.
+        // Slow poll (60 s) — port modes / link rates / FEC don't change
+        // hot. Pairs with `ip_interfaces` (the logical interfaces bound
+        // to physical ports via `physicalPortId`).
+        if slot_caps.has_module("ipGateway", "physicalports") {
+            let v = slot_caps
+                .module_version("ipGateway", "physicalports")
+                .unwrap_or("1.57")
+                .to_string();
+            let v_pp = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                config.xger_config_interval_secs,
+                &format!("ipgw-phys-ports-slot{slot}"),
+                move |c, st| {
+                    let v = v_pp.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/physicalports/GetPhysicalPorts");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_phys_ports(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+            let v_vp = v.clone();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                config.xger_config_interval_secs,
+                &format!("ipgw-virtual-ports-slot{slot}"),
+                move |c, st| {
+                    let v = v_vp.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/physicalports/GetVirtualPorts");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_virtual_ports(slot, r.get("data").cloned().unwrap_or(json!([]))).await;
+                        Ok(())
+                    })
+                },
+            );
+        }
+
+        // ── Phase F: TimeX (chassis-side PTP + system time) ──
+        //
+        // Loaded on commissioned X10/X20 chassis with a card-level PTP
+        // engine. Bare X5 HEVC SDI 1.0.2 doesn't expose the TimeX module —
+        // the discovery pass quietly skips it and these spawns no-op.
+        // Slow poll (60 s) — PTP state transitions are rare and the
+        // chassis raises its own alarm events on lock loss.
+        spawn_iface_slow_raw(
+            slot_caps, "TimeX", "cardPtp", "GetPtpStatus",
+            &client, &state, &cancel, config.xger_config_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_ptp_status(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "TimeX", "cardPtp", "GetPtpSettings",
+            &client, &state, &cancel, config.xger_config_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_ptp_settings(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "TimeX", "systemTimeSettings", "GetSystemTimeStatus",
+            &client, &state, &cancel, config.xger_config_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_system_time_status(slot, raw).await; });
+            },
+        );
+
+        // Phase B: alarm-trigger config snapshot. Returned shape is one
+        // opaque object per slot ({config: {triggers: [{key, value}]}}).
+        if slot_caps.has_module("ipGateway", "triggers") {
+            let v = slot_caps
+                .module_version("ipGateway", "triggers")
+                .unwrap_or("1.57")
+                .to_string();
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                config.xger_config_interval_secs,
+                &format!("ipgw-triggers-slot{slot}"),
+                move |c, st| {
+                    let v = v.clone();
+                    Box::pin(async move {
+                        let m = format!("ipGateway:{v}/triggers/GetTriggers");
+                        let r = c.call_board(slot, &m, json!({})).await?;
+                        st.set_triggers(slot, r).await;
+                        Ok(())
+                    })
+                },
+            );
+        }
+
         if slot_caps.has_module("ipGateway", "ipinterface") {
             let v = slot_caps
                 .module_version("ipGateway", "ipinterface")
@@ -518,6 +722,91 @@ pub async fn run_polling(
             },
         );
 
+        // ── SDI physical-card family (sdi reference; lowercase modules) ──
+        //
+        // Broadcast engineers' first question is always "is the SDI source
+        // locked?". `sdi:*/portstatus/GetPortStatus` returns per-port lock,
+        // detected video standard (1080i59.94, 720p50, 270 Mb/s), CRC error
+        // counters. Fast-polled so MCR sees lock loss within ~5 s.
+        // `sdi:*/cardinfo` and `sdi:*/physicalports` are slow inventory
+        // surfaces (port count, 12G/3G capability) — operator-facing rig
+        // confirmation, polled at the slow Xger config cadence.
+        spawn_iface_slow_raw(
+            slot_caps, "sdi", "portstatus", "GetPortStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_sdi_port_status(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "sdi", "cardinfo", "GetCardInfo",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_sdi_card_info(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "sdi", "physicalports", "GetPhysicalPorts",
+            &client, &state, &cancel, slow,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_sdi_physical_ports(slot, raw).await; });
+            },
+        );
+
+        // ── Encoder / decoder transport status (hip family) ─────────────
+        //
+        // `hipEncStatus/GetEncoderTransportStatus` and
+        // `hipDecStatus/GetDecoderStatus` are the fast-poll surfaces that
+        // give live bitrate, packet loss, IDR cadence, and decoder lock.
+        // They live under the *same* hipEnc / hipTsEnc / hipDec / hipTsDec
+        // interfaces as the runtime config polls already wired above.
+        // Slot only carries one family at a time, so per-slot
+        // last-write-wins on the snapshot is correct. `hipNetworkStatus`
+        // is the per-iface counter blob — lives only on hipEnc today.
+        spawn_iface_slow_raw(
+            slot_caps, "hipEnc", "hipEncStatus", "GetEncoderTransportStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_encoder_transport(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipTsEnc", "hipEncStatus", "GetEncoderTransportStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_encoder_transport(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipDec", "hipDecStatus", "GetDecoderStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_decoder_status(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipTsDec", "hipDecStatus", "GetDecoderStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_decoder_status(slot, raw).await; });
+            },
+        );
+        spawn_iface_slow_raw(
+            slot_caps, "hipEnc", "hipNetworkStatus", "GetNetworkStatus",
+            &client, &state, &cancel, config.card_status_interval_secs,
+            |st, slot, raw| {
+                let st = st.clone();
+                tokio::spawn(async move { st.set_hip_network_status(slot, raw).await; });
+            },
+        );
+
         // ── board:{ver}/services/GetOutputServices ───────────────────
         //
         // On the X5 / X10 / X20 card-manager firmware the `Xger:*/ipConnection`
@@ -536,6 +825,8 @@ pub async fn run_polling(
                 .module_version("board", "services")
                 .unwrap_or("2.16")
                 .to_string();
+            // Output services — destinations the chassis sends to.
+            let v_out = v.clone();
             spawn_state_poll(
                 client.clone(),
                 state.clone(),
@@ -543,11 +834,39 @@ pub async fn run_polling(
                 slow,
                 &format!("board-output-services-slot{slot}"),
                 move |c, st| {
-                    let v = v.clone();
+                    let v = v_out.clone();
                     Box::pin(async move {
                         let method = format!("board:{v}/services/GetOutputServices");
                         let r = c.call_board(slot, &method, json!({})).await?;
                         st.set_output_services(
+                            slot,
+                            r.get("data").cloned().unwrap_or(json!([])),
+                        )
+                        .await;
+                        Ok(())
+                    })
+                },
+            );
+            // Input services — flow sources, including SRT listener
+            // outputs (`Flow::FlowSource::SrtOutputProxy::`), encoder
+            // CoderOutput entries, and DvbSource feeds. On X5 HEVC SDI
+            // firmware this is the only place these are visible — the
+            // dedicated Xger:*/coderService and Xger:*/ipConnection
+            // modules aren't loaded. Newer firmware (board:2.16+)
+            // requires `{query:{}}` rather than `{}`; pass the safer
+            // shape unconditionally.
+            spawn_state_poll(
+                client.clone(),
+                state.clone(),
+                cancel.child_token(),
+                slow,
+                &format!("board-input-services-slot{slot}"),
+                move |c, st| {
+                    let v = v.clone();
+                    Box::pin(async move {
+                        let method = format!("board:{v}/services/GetInputServices");
+                        let r = c.call_board(slot, &method, json!({"query": {}})).await?;
+                        st.set_input_services(
                             slot,
                             r.get("data").cloned().unwrap_or(json!([])),
                         )
@@ -603,6 +922,7 @@ fn spawn_alarms_poller(
     cancel: &CancellationToken,
 ) {
     let alarms_method = format!("mmi:{}/alarms/GetActiveAlarms", config.alarms_mmi_version);
+    let alarms_refresh_interval_secs = config.alarms_refresh_interval_secs;
     let emitter = emitter.clone();
     let event_gate = event_gate.clone();
     let identity = identity.clone();
@@ -640,7 +960,7 @@ fn spawn_alarms_poller(
                             alarms_value.as_array().cloned().unwrap_or_default();
                         let status = derive_status(&alarm_list);
                         let (new_alarms, cleared_ids) =
-                            st.set_alarms(alarm_list, status).await;
+                            st.set_alarms(alarm_list, status, alarms_refresh_interval_secs).await;
 
                         for alarm in &new_alarms {
                             let severity = alarm
@@ -826,6 +1146,43 @@ fn spawn_chassis_poller(
     );
 }
 
+/// Chassis-side uptime poller. The `mmi:*/uptime/GetSystemUptime` module is
+/// only present on current X Platform 1.0.x firmware (X5 HEVC SDI 1.0.2 and
+/// later). On older firmware it returns "Method not found" and the poller
+/// silently keeps trying — `chassis_uptime_secs` stays `None` and the
+/// manager UI hides the "Chassis up for …" line. No behaviour change for
+/// firmware that doesn't expose it. The poll cadence is slow (default 60 s)
+/// because uptime increments by exactly the cadence — there's no value in
+/// polling it any faster.
+fn spawn_uptime_poller(
+    client: &JsonRpcClient,
+    config: &PollingConfig,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+) {
+    let method = format!("mmi:{}/uptime/GetSystemUptime", config.uptime_mmi_version);
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        config.uptime_interval_secs,
+        "uptime",
+        move |c, st| {
+            let method = method.clone();
+            Box::pin(async move {
+                // Soft-fail on "Method not found" — older firmware doesn't
+                // expose the uptime module. The chassis_uptime_secs field
+                // stays None and the manager UI hides it, no events fire.
+                match c.call_mmi(&method, json!({})).await {
+                    Ok(r) => st.set_chassis_uptime(r).await,
+                    Err(e) => debug!("uptime poll failed (firmware may not expose mmi:*/uptime): {e}"),
+                }
+                Ok(())
+            })
+        },
+    );
+}
+
 fn spawn_cards_poller(
     client: &JsonRpcClient,
     config: &PollingConfig,
@@ -851,6 +1208,115 @@ fn spawn_cards_poller(
                     states.get("cards").cloned().unwrap_or(json!([])),
                 )
                 .await;
+                Ok(())
+            })
+        },
+    );
+}
+
+/// Chassis-wide pool pollers — `/mmi/service_encoderpool/api/jsonrpc` and
+/// `/mmi/service_decoderpool/api/jsonrpc`. On X5 HEVC SDI firmware these
+/// are the canonical surfaces for video profiles, audio profiles, coder
+/// services, and test-generator profiles. The per-slot Xger:* equivalents
+/// either don't exist or return empty data on this firmware family.
+///
+/// Each call is wrapped in a tolerant closure that swallows
+/// "method not found" errors — different firmware versions of the same
+/// service support different module-versions, and probing every
+/// permutation at startup is cheaper-on-the-wire than failing every
+/// poll cycle. The first version that responds wins; subsequent calls
+/// reuse it via the cached version map (future work — for now we just
+/// try the most common version once per poll cycle).
+fn spawn_pool_pollers(
+    client: &JsonRpcClient,
+    config: &PollingConfig,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+) {
+    let slow = config.xger_config_interval_secs;
+
+    // Encoder pool — video profiles + audio profiles + coder services + test-gen profiles.
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "encoderpool", "Xger:2.55/videoProfile/GetVideoProfiles",
+        "encoder-pool-video-profiles",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_pool_video_profiles(items).await; }); },
+    );
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "encoderpool", "Xger:2.55/audioProfile/GetAudioProfiles",
+        "encoder-pool-audio-profiles",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_pool_audio_profiles(items).await; }); },
+    );
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "encoderpool", "Xger:2.55/coderService/GetCoderServices",
+        "encoder-pool-coder-services",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_pool_coder_services(items).await; }); },
+    );
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "encoderpool", "Xger:2.55/testGeneratorProfile/GetTestGeneratorProfiles",
+        "encoder-pool-test-generator-profiles",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_pool_test_generator_profiles(items).await; }); },
+    );
+
+    // Decoder pool — video profiles + coder services.
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "decoderpool", "Xger:2.55/videoProfile/GetVideoProfiles",
+        "decoder-pool-video-profiles",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_decoder_pool_video_profiles(items).await; }); },
+    );
+    spawn_pool_call(
+        client, state, cancel, slow,
+        "decoderpool", "Xger:2.55/coderService/GetCoderServices",
+        "decoder-pool-coder-services",
+        |st, items| { let st = st.clone(); tokio::spawn(async move { st.set_decoder_pool_coder_services(items).await; }); },
+    );
+}
+
+/// Spawn a single tolerant poller against a `/mmi/service_<name>/api/jsonrpc`
+/// endpoint. Treats any RPC error (method not found, service missing,
+/// chassis unreachable for this poll) as "no data" — sets an empty
+/// array on first failure so the manager UI sees a consistent shape.
+/// Different from the per-slot Xger pollers which gate on discovery;
+/// the pool surfaces are not in the discovery registry today, so we
+/// probe by attempting the call.
+fn spawn_pool_call<F>(
+    client: &JsonRpcClient,
+    state: &SharedAppearXState,
+    cancel: &CancellationToken,
+    interval_secs: u64,
+    service: &'static str,
+    method: &'static str,
+    name: &'static str,
+    apply: F,
+) where
+    F: Fn(SharedAppearXState, Value) + Send + Sync + 'static + Clone,
+{
+    let apply = apply.clone();
+    spawn_state_poll(
+        client.clone(),
+        state.clone(),
+        cancel.child_token(),
+        interval_secs,
+        name,
+        move |c, st| {
+            let apply = apply.clone();
+            Box::pin(async move {
+                match c.call_service(service, method, json!({})).await {
+                    Ok(r) => {
+                        let data = r.get("data").cloned().unwrap_or(json!([]));
+                        apply(st, data);
+                    }
+                    Err(e) => {
+                        // Soft-fail: log at debug, set empty so the snapshot
+                        // doesn't carry stale data from a previous run.
+                        debug!("pool poll {service}/{method} failed: {e}");
+                        apply(st, json!([]));
+                    }
+                }
                 Ok(())
             })
         },

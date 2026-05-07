@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use super::capabilities::{DeviceCapabilities, SlotCapabilities};
@@ -23,14 +23,72 @@ pub struct AppearXState {
     pub alarms: Vec<Value>,
     /// Alarm IDs from the previous poll, used for change detection.
     pub prev_alarm_ids: HashSet<String>,
+    /// Last time `prev_alarm_ids` was force-cleared so the next poll
+    /// re-emits every active alarm as a fresh `alarm` event. Drives the
+    /// periodic re-emission described on `set_alarms` — chronic alarms
+    /// otherwise emit one event on first observation and never again,
+    /// leaving the manager events page empty for stable-but-broken
+    /// chassis.
+    pub last_alarm_refresh: Option<Instant>,
     pub status: String, // "ok" | "degraded" | "critical"
     pub chassis: Option<Value>,
     pub chassis_info: Option<Value>,
     pub card_states: Vec<Value>,
+    /// Chassis-side uptime in seconds, from `mmi:*/uptime/GetSystemUptime`.
+    /// Distinct from the gateway sidecar's own uptime — this is how long the
+    /// Appear X chassis itself has been up since its last reboot. `None`
+    /// until the first uptime poll completes (or if the firmware doesn't
+    /// expose the `uptime` module — older variants don't).
+    pub chassis_uptime_secs: Option<u64>,
     // ─ ipGateway (legacy IP Gateway boards) ─
     pub inputs: BTreeMap<u32, Vec<Value>>,
     pub outputs: BTreeMap<u32, Vec<Value>>,
     pub ip_interfaces: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: live IP-input telemetry from `ipGateway:*/status/GetIpInputStatus`.
+    /// Per-slot raw `data` array — each entry carries `bitrates`, `rtpErrors`,
+    /// `ccErrors`, `syncByteError`, `teiBitError` for the input keyed by UUID.
+    /// Fast-polled (5 s) so the dashboard sees bitrate / error spikes.
+    pub ip_input_status: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: live IP-output telemetry. Same shape as `ip_input_status`
+    /// per `GetIpOutputStatus` / `GetOutputStatus` (the firmware accepts
+    /// either name; the poller asks for `GetIpOutputStatus` first).
+    pub ip_output_status: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: live SRT-input telemetry from `GetSrtInputStatus` — peer
+    /// endpoint, peer stream ID, SRT latency, RTT, retransmits, encryption
+    /// state, dropped packets. Empty array on chassis with no SRT inputs.
+    pub srt_input_status: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: live SRT-output telemetry from `GetSrtOutputStatus`.
+    pub srt_output_status: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: physical-port inventory and link state from
+    /// `ipGateway:*/physicalports/GetPhysicalPorts`. Per-slot raw `data`
+    /// array — each entry has `name`, `label`, `enabled`, `portMode`
+    /// (SFP/RJ45), `ipLinkMode` (1G/10G/25G), `portFecMode`, `rx`/`tx`,
+    /// `bridge`, `ospf`, optional SFP optical metrics. Slow poll.
+    pub phys_ports: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: virtual port pairs (LACP / channel bonding) from
+    /// `physicalports/GetVirtualPorts`. Each entry pairs two physical
+    /// ports with `channelBonding` mode and `replicateLinkState` flag.
+    pub virtual_ports: BTreeMap<u32, Vec<Value>>,
+    /// Phase B: per-card alarm-trigger config from
+    /// `ipGateway:*/triggers/GetTriggers`. Single object per slot —
+    /// `{config: {triggers: [{key, value}]}}` where each entry maps a
+    /// trigger name (e.g. `"stream_analysis/pcr_dejitter_regulator_event"`)
+    /// to whether it's armed. Read-only here; alarm overrides live in
+    /// `mmi:*/alarms/{Get,Set,Delete}AlarmOverrides`.
+    pub triggers: BTreeMap<u32, Value>,
+    /// Phase F: TimeX:*/cardPtp/GetPtpStatus per slot. Lock state, master
+    /// offset, mean path delay, grandmaster identity. Slow poll because
+    /// PTP transitions are infrequent and the alarm engine raises events
+    /// on lock-loss anyway.
+    pub ptp_status: BTreeMap<u32, Value>,
+    /// Phase F: TimeX:*/cardPtp/GetPtpSettings per slot. Domain, profile,
+    /// transport mode, port settings. Read-only snapshot; SetPtpSettings
+    /// writes via the command handler.
+    pub ptp_settings: BTreeMap<u32, Value>,
+    /// Phase F: TimeX:*/systemTimeSettings/GetSystemTimeStatus per slot.
+    /// Active source (PTP / NTP / manual / RTC), slew/step state,
+    /// holdover seconds remaining.
+    pub system_time_status: BTreeMap<u32, Value>,
     // ─ Xger (X5/X10/X20 card-manager surface) ─
     /// Raw `Xger:*/cardStatus/GetCardStatus` result per slot — carries PTP
     /// lock, NMOS registry status, QSFP/SFP diagnostics, and physicalPort
@@ -89,6 +147,32 @@ pub struct AppearXState {
     /// `Xger:*/psiStatus/GetPsiStatus` — decoded PSI/SI tables from active
     /// TS inputs. Present only on commissioned units.
     pub psi_status: BTreeMap<u32, Value>,
+    /// `sdi:*/portstatus/GetPortStatus` per slot — SDI physical port lock,
+    /// detected standard (1080i59.94, 720p50, 270 Mb/s, …), EAV/CRC
+    /// counters. Fast-polled — broadcast engineers monitor lock loss in
+    /// real time during a show. Empty on chassis without sdi-family cards.
+    pub sdi_port_status: BTreeMap<u32, Value>,
+    /// `sdi:*/cardinfo/GetCardInfo` per slot — static SDI card metadata
+    /// (port count, supported standards). Slow poll — operator-facing
+    /// inventory, not a live signal.
+    pub sdi_card_info: BTreeMap<u32, Value>,
+    /// `sdi:*/physicalports/GetPhysicalPorts` per slot — port labels and
+    /// 12G/3G capabilities. Slow poll. Pairs with `sdi_port_status` to give
+    /// a complete SDI-port read.
+    pub sdi_physical_ports: BTreeMap<u32, Value>,
+    /// `hipEnc:*/hipEncStatus/GetEncoderTransportStatus` (or `hipTsEnc:*`)
+    /// per slot — live encoder transport metrics (target/measured bitrate,
+    /// IDR cadence, packet loss). Fast-polled. The hipTsEnc and hipEnc
+    /// families both use `hipEncStatus`, so per-slot last-write-wins is
+    /// fine — a slot only carries one of those families.
+    pub hip_encoder_transport: BTreeMap<u32, Value>,
+    /// `hipDec:*/hipDecStatus/GetDecoderStatus` (or `hipTsDec:*`) per slot
+    /// — live decoder lock state, error rates, A/V drift. Fast-polled.
+    pub hip_decoder_status: BTreeMap<u32, Value>,
+    /// `hipEnc:*/hipNetworkStatus/GetNetworkStatus` per slot — per-iface
+    /// tx/rx counters and error counts on the encoder card's network
+    /// stack. Fast-polled.
+    pub hip_network_status: BTreeMap<u32, Value>,
     // ─ board (cross-board services) ─
     /// `board:{ver}/services/GetOutputServices` per slot — the native way
     /// the Appear X card-manager exposes configured IP outputs on X5 /
@@ -100,6 +184,43 @@ pub struct AppearXState {
     /// `label` / `name` but different `body.address` — the manager UI
     /// groups them visually as one logical output with A/B legs.
     pub output_services: BTreeMap<u32, Vec<Value>>,
+    /// `board:{ver}/services/GetInputServices` per slot — the source side
+    /// of the same flow graph. On X5 HEVC SDI firmware this is where SRT
+    /// listener outputs surface as `Flow::FlowSource::SrtOutputProxy::`,
+    /// and encoder CoderOutput entries (with attached DvbSource /
+    /// ServiceSource sources) live. Without polling this, the manager UI
+    /// can't see the SRT listener or the encoder pipeline configuration
+    /// even though they're fully configured on the chassis. Same `body`
+    /// JSON-string shape as output_services.
+    pub input_services: BTreeMap<u32, Vec<Value>>,
+
+    // ─ Chassis-wide pool surfaces (X5 HEVC SDI's actual encoder API) ─
+    //
+    // The X5 HEVC SDI firmware exposes its encoder/decoder configuration at
+    // a chassis-wide service endpoint (`/mmi/service_encoderpool/api/jsonrpc`
+    // and `/mmi/service_decoderpool/api/jsonrpc`), NOT on the per-slot board
+    // endpoint. This is the missing surface that earlier polling didn't
+    // reach — the `Xger:*/coderService` / `Xger:*/videoProfile` modules
+    // simply aren't loaded under `/board/<n>/`. Storage is flat (no slot
+    // dimension) because the data is genuinely chassis-scoped here.
+    /// Encoder-pool video profiles (`videoProfile/GetVideoProfiles`).
+    pub pool_video_profiles: Vec<Value>,
+    /// Encoder-pool audio profiles (`audioProfile/GetAudioProfiles`).
+    /// Note: this duplicates the per-slot `audio_profiles` field on
+    /// chassis where both endpoints serve the same data, but the
+    /// service-level call is the canonical surface; the per-slot one
+    /// is firmware-specific and may be empty on some units.
+    pub pool_audio_profiles: Vec<Value>,
+    /// Encoder-pool coder services (`coderService/GetCoderServices`).
+    /// Each entry references a video profile UUID via `value.video.profile.id`.
+    pub pool_coder_services: Vec<Value>,
+    /// Encoder-pool test-generator profiles
+    /// (`testGeneratorProfile/GetTestGeneratorProfiles`).
+    pub pool_test_generator_profiles: Vec<Value>,
+    /// Decoder-pool video profiles.
+    pub decoder_pool_video_profiles: Vec<Value>,
+    /// Decoder-pool coder services.
+    pub decoder_pool_coder_services: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -137,12 +258,49 @@ impl SharedAppearXState {
     /// Update alarms and return (new_alarms, cleared_alarm_ids) for event
     /// forwarding. An alarm is "new" if its `alarmId` was not in the previous
     /// poll; "cleared" if its previous `alarmId` is no longer present.
+    /// Diff the latest alarm snapshot against the previous one and return
+    /// `(new_alarms, cleared_ids)` so the polling layer can emit one event
+    /// per transition. Identifies alarms by their `alarmId`.
+    ///
+    /// **Periodic re-emission.** Chronic alarms — alarms the chassis has
+    /// raised and not yet cleared — emit exactly one event on first
+    /// observation. After that, no further events fire until the alarm
+    /// clears (and re-raises). That leaves the manager's events page
+    /// empty for chassis whose alarms have been stable for hours, even
+    /// though the chassis itself is still broken. To keep operators
+    /// honest, every `refresh_interval_secs` we force-clear
+    /// `prev_alarm_ids` so the next diff treats all currently-active
+    /// alarms as new and emits a fresh event per alarm. Pass `0` to
+    /// disable (steady state will then mirror the legacy
+    /// raise-once-on-first-observation behaviour). Default 1800 s
+    /// (30 minutes) — see config.rs for the operator knob.
     pub async fn set_alarms(
         &self,
         alarms: Vec<Value>,
         status: &str,
+        refresh_interval_secs: u64,
     ) -> (Vec<Value>, Vec<String>) {
         let mut g = self.inner.write().await;
+
+        // Periodic refresh: if the last refresh was long enough ago,
+        // wipe `prev_alarm_ids` so the next diff considers every active
+        // alarm as "new" and emits a fresh event. The first call ever
+        // (no previous refresh recorded) just stamps the clock without
+        // wiping — the empty `prev_alarm_ids` already triggers the
+        // first round of emissions naturally.
+        if refresh_interval_secs > 0 {
+            let now = Instant::now();
+            match g.last_alarm_refresh {
+                Some(prev) if now.duration_since(prev) >= Duration::from_secs(refresh_interval_secs) => {
+                    g.prev_alarm_ids.clear();
+                    g.last_alarm_refresh = Some(now);
+                }
+                None => {
+                    g.last_alarm_refresh = Some(now);
+                }
+                _ => {}
+            }
+        }
 
         let current_ids: HashSet<String> = alarms
             .iter()
@@ -179,6 +337,33 @@ impl SharedAppearXState {
         g.chassis = Some(chassis);
     }
 
+    /// Update the chassis-side uptime from a `mmi:*/uptime/GetSystemUptime`
+    /// response. The wire shape is `{systemUptime: [{key: <slot|0>, value:
+    /// "<seconds>"}]}` — the chassis returns a string-encoded u64 (Appear's
+    /// JSON-RPC convention for u64 values). We pick the numeric maximum
+    /// across the array so multi-card chassis report the longest-running
+    /// component, which is the most useful "is the chassis stable?" signal.
+    pub async fn set_chassis_uptime(&self, raw: Value) {
+        let mut max_secs: Option<u64> = None;
+        if let Some(arr) = raw.get("systemUptime").and_then(|v| v.as_array()) {
+            for entry in arr {
+                let v = entry.get("value");
+                let parsed = match v {
+                    Some(Value::String(s)) => s.parse::<u64>().ok(),
+                    Some(Value::Number(n)) => n.as_u64(),
+                    _ => None,
+                };
+                if let Some(n) = parsed {
+                    max_secs = Some(match max_secs { Some(m) => m.max(n), None => n });
+                }
+            }
+        }
+        if max_secs.is_some() {
+            let mut g = self.inner.write().await;
+            g.chassis_uptime_secs = max_secs;
+        }
+    }
+
     pub async fn set_cards(&self, info: Value, states: Value) {
         let mut g = self.inner.write().await;
         g.chassis_info = Some(info);
@@ -195,6 +380,58 @@ impl SharedAppearXState {
         let mut g = self.inner.write().await;
         g.outputs
             .insert(slot, outputs.as_array().cloned().unwrap_or_default());
+    }
+
+    /// Phase B setters: per-slot live status arrays from `ipGateway:*/status/Get*`.
+    pub async fn set_ip_input_status(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.ip_input_status
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    pub async fn set_ip_output_status(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.ip_output_status
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    pub async fn set_srt_input_status(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.srt_input_status
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    pub async fn set_srt_output_status(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.srt_output_status
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    /// Phase B: physical port inventory + link state per slot.
+    pub async fn set_phys_ports(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.phys_ports
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    pub async fn set_virtual_ports(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.virtual_ports
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+    /// Phase B: per-card alarm trigger config (read-only snapshot).
+    pub async fn set_triggers(&self, slot: u32, raw: Value) {
+        let mut g = self.inner.write().await;
+        g.triggers.insert(slot, raw);
+    }
+
+    /// Phase F: per-slot TimeX state.
+    pub async fn set_ptp_status(&self, slot: u32, raw: Value) {
+        let mut g = self.inner.write().await;
+        g.ptp_status.insert(slot, raw);
+    }
+    pub async fn set_ptp_settings(&self, slot: u32, raw: Value) {
+        let mut g = self.inner.write().await;
+        g.ptp_settings.insert(slot, raw);
+    }
+    pub async fn set_system_time_status(&self, slot: u32, raw: Value) {
+        let mut g = self.inner.write().await;
+        g.system_time_status.insert(slot, raw);
     }
 
     pub async fn set_slot_ip_interfaces(&self, slot: u32, ifaces: Value) {
@@ -298,6 +535,36 @@ impl SharedAppearXState {
         g.psi_status.insert(slot, v);
     }
 
+    pub async fn set_sdi_port_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.sdi_port_status.insert(slot, v);
+    }
+
+    pub async fn set_sdi_card_info(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.sdi_card_info.insert(slot, v);
+    }
+
+    pub async fn set_sdi_physical_ports(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.sdi_physical_ports.insert(slot, v);
+    }
+
+    pub async fn set_hip_encoder_transport(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.hip_encoder_transport.insert(slot, v);
+    }
+
+    pub async fn set_hip_decoder_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.hip_decoder_status.insert(slot, v);
+    }
+
+    pub async fn set_hip_network_status(&self, slot: u32, v: Value) {
+        let mut g = self.inner.write().await;
+        g.hip_network_status.insert(slot, v);
+    }
+
     /// Set the per-slot `GetOutputServices` reply (a flat array of IP-output
     /// service records). Extracts the outer `data.[]` envelope so the stored
     /// shape is homogeneous with [`set_slot_outputs`].
@@ -305,6 +572,42 @@ impl SharedAppearXState {
         let mut g = self.inner.write().await;
         g.output_services
             .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+
+    /// Set the per-slot `GetInputServices` reply (a flat array of
+    /// flow-source service records — SRT listeners, encoder CoderOutput,
+    /// DvbSource, etc.). Same shape and storage idiom as output_services.
+    pub async fn set_input_services(&self, slot: u32, items: Value) {
+        let mut g = self.inner.write().await;
+        g.input_services
+            .insert(slot, items.as_array().cloned().unwrap_or_default());
+    }
+
+    // ─ Chassis-wide pool setters ─
+
+    pub async fn set_pool_video_profiles(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.pool_video_profiles = items.as_array().cloned().unwrap_or_default();
+    }
+    pub async fn set_pool_audio_profiles(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.pool_audio_profiles = items.as_array().cloned().unwrap_or_default();
+    }
+    pub async fn set_pool_coder_services(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.pool_coder_services = items.as_array().cloned().unwrap_or_default();
+    }
+    pub async fn set_pool_test_generator_profiles(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.pool_test_generator_profiles = items.as_array().cloned().unwrap_or_default();
+    }
+    pub async fn set_decoder_pool_video_profiles(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.decoder_pool_video_profiles = items.as_array().cloned().unwrap_or_default();
+    }
+    pub async fn set_decoder_pool_coder_services(&self, items: Value) {
+        let mut g = self.inner.write().await;
+        g.decoder_pool_coder_services = items.as_array().cloned().unwrap_or_default();
     }
 
     /// Look up the discovered API version for a `<interface>/<module>` pair
@@ -331,6 +634,16 @@ impl SharedAppearXState {
         let outputs_flat = flatten_with_slot(&g.outputs);
         let ifaces_flat = flatten_with_slot(&g.ip_interfaces);
 
+        // Phase B: live status surfaces. Flat per-slot arrays — each entry
+        // already carries the input/output UUID as `key`, so the dashboard
+        // joins to the config-side entries by `(slot, key)`.
+        let ip_input_status_flat = flatten_with_slot(&g.ip_input_status);
+        let ip_output_status_flat = flatten_with_slot(&g.ip_output_status);
+        let srt_input_status_flat = flatten_with_slot(&g.srt_input_status);
+        let srt_output_status_flat = flatten_with_slot(&g.srt_output_status);
+        let phys_ports_flat = flatten_with_slot(&g.phys_ports);
+        let virtual_ports_flat = flatten_with_slot(&g.virtual_ports);
+
         // Xger family (card-manager) flattened same way.
         let coder_services_flat = flatten_with_slot(&g.coder_services);
         let multi_services_flat = flatten_with_slot(&g.multi_services);
@@ -338,6 +651,7 @@ impl SharedAppearXState {
         let xger_ip_interfaces_flat = flatten_with_slot(&g.xger_ip_interfaces);
         let card_allocations_flat = flatten_with_slot(&g.card_allocations);
         let output_services_flat = flatten_with_slot(&g.output_services);
+        let input_services_flat = flatten_with_slot(&g.input_services);
         let ip_connections_flat = flatten_with_slot(&g.ip_connections);
         let redundancy_groups_flat = flatten_with_slot(&g.redundancy_groups);
 
@@ -354,6 +668,16 @@ impl SharedAppearXState {
         let dpi_status_map = slot_map_to_json(&g.dpi_status);
         let esam_status_map = slot_map_to_json(&g.esam_status);
         let pois_server_status_map = slot_map_to_json(&g.pois_server_status);
+        let sdi_port_status_map = slot_map_to_json(&g.sdi_port_status);
+        let sdi_card_info_map = slot_map_to_json(&g.sdi_card_info);
+        let sdi_physical_ports_map = slot_map_to_json(&g.sdi_physical_ports);
+        let hip_encoder_transport_map = slot_map_to_json(&g.hip_encoder_transport);
+        let hip_decoder_status_map = slot_map_to_json(&g.hip_decoder_status);
+        let hip_network_status_map = slot_map_to_json(&g.hip_network_status);
+        let triggers_map = slot_map_to_json(&g.triggers);
+        let ptp_status_map = slot_map_to_json(&g.ptp_status);
+        let ptp_settings_map = slot_map_to_json(&g.ptp_settings);
+        let system_time_status_map = slot_map_to_json(&g.system_time_status);
 
         // Health signals derived from card_status for easy metric extraction
         // on the manager side (and human-readable header badges).
@@ -370,11 +694,17 @@ impl SharedAppearXState {
             .collect();
 
         let uptime_secs = self.started_at.elapsed().as_secs();
+        let chassis_uptime_secs = g.chassis_uptime_secs;
 
         json!({
             "status": g.status,
             "version": self.version,
+            // `uptime_secs` is the gateway sidecar's own uptime (process
+            // age). The chassis-side uptime — how long the Appear X box
+            // itself has been up — is in `chassis_uptime_secs` when
+            // available. Manager UI prefers chassis_uptime when present.
             "uptime_secs": uptime_secs,
+            "chassis_uptime_secs": chassis_uptime_secs,
             "chassis_model": self.caps.chassis_type,
             "appear_x_address": self.appear_x_address,
             "chassis": g.chassis.clone().unwrap_or(json!(null)),
@@ -391,6 +721,17 @@ impl SharedAppearXState {
             "xger_ip_interfaces": xger_ip_interfaces_flat,
             "card_allocations": card_allocations_flat,
             "output_services": output_services_flat,
+            "input_services": input_services_flat,
+            // Chassis-wide encoder/decoder pool surfaces — this is where
+            // the X5 HEVC SDI firmware actually exposes video profiles,
+            // audio profiles, and full coder service configurations.
+            // Hosted at `/mmi/service_encoderpool/api/jsonrpc`.
+            "pool_video_profiles": g.pool_video_profiles,
+            "pool_audio_profiles": g.pool_audio_profiles,
+            "pool_coder_services": g.pool_coder_services,
+            "pool_test_generator_profiles": g.pool_test_generator_profiles,
+            "decoder_pool_video_profiles": g.decoder_pool_video_profiles,
+            "decoder_pool_coder_services": g.decoder_pool_coder_services,
             "ip_connections": ip_connections_flat,
             "redundancy_groups": redundancy_groups_flat,
             "redundancy_group_status": redundancy_group_status_map,
@@ -403,6 +744,24 @@ impl SharedAppearXState {
             "dpi_status": dpi_status_map,
             "esam_status": esam_status_map,
             "pois_server_status": pois_server_status_map,
+            "sdi_port_status": sdi_port_status_map,
+            "sdi_card_info": sdi_card_info_map,
+            "sdi_physical_ports": sdi_physical_ports_map,
+            "hip_encoder_transport": hip_encoder_transport_map,
+            "hip_decoder_status": hip_decoder_status_map,
+            "hip_network_status": hip_network_status_map,
+            // Phase B: live IP/SRT input/output telemetry.
+            "ip_input_status": ip_input_status_flat,
+            "ip_output_status": ip_output_status_flat,
+            "srt_input_status": srt_input_status_flat,
+            "srt_output_status": srt_output_status_flat,
+            "phys_ports": phys_ports_flat,
+            "virtual_ports": virtual_ports_flat,
+            "triggers": triggers_map,
+            // Phase F: TimeX (chassis with PTP / system-time card support).
+            "ptp_status": ptp_status_map,
+            "ptp_settings": ptp_settings_map,
+            "system_time_status": system_time_status_map,
             "health_signals": health_signals,
         })
     }
