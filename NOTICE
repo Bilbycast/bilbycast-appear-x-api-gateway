@@ -1,0 +1,37 @@
+bilbycast-appear-x-api-gateway
+==============================
+
+Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
+
+Licensed under the bilbycast-appear-x-api-gateway Proprietary
+Software Licence. See LICENSE for the full text. Commercial use,
+redistribution, modification, and reverse engineering are
+restricted — contact contact@bilbycast.com for licensing.
+
+Bundled third-party components
+------------------------------
+
+| Component                  | Licence                         |
+|----------------------------|---------------------------------|
+| bilbycast-gateway-sdk      | LicenseRef-Bilbycast-Proprietary|
+| Rust crates                | MIT / Apache-2.0 / BSD-3-Clause |
+|                            | (see Cargo.lock)                |
+
+Source code availability
+------------------------
+
+This software is proprietary; corresponding source is not
+distributed publicly. Licensees with source access obtain it
+through their commercial licence agreement with Softside Tech
+Pty Ltd.
+
+Trademarks
+----------
+
+"Appear" and "Appear X" are trademarks of Appear AS. This
+software is an independent integration that communicates with
+Appear X equipment via published JSON-RPC APIs and is not
+affiliated with, endorsed by, or sponsored by Appear AS.
+
+This notice is not legal advice. Consult a qualified IP attorney
+for your specific deployment.
