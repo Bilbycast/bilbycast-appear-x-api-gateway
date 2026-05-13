@@ -274,6 +274,9 @@ mv -Tf "${INSTALL_ROOT}/current.tmp" "${INSTALL_ROOT}/current"
 # ── Create system user + group ─────────────────────────────────────────
 if ! id -u bilbycast-gateway > /dev/null 2>&1; then
     if command -v systemd-sysusers > /dev/null 2>&1; then
+        # /etc/sysusers.d/ doesn't exist on minimal Ubuntu / Debian images
+        # by default, even when systemd-sysusers is present. Pre-create it.
+        mkdir -p /etc/sysusers.d
         cat > /etc/sysusers.d/bilbycast-gateway.conf <<'EOF'
 u bilbycast-gateway - "bilbycast gateway sidecar service account" /var/lib/bilbycast/appear-x-gateway /usr/sbin/nologin
 EOF
