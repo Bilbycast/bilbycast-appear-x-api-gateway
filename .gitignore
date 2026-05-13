@@ -38,3 +38,7 @@ tls/
 # Project-specific
 *.license
 *.pub
+
+# Vendor-supplied Appear X platform API docs (kept locally for reference; not
+# part of this project's distributable source).
+/Appear-X-Platform-API/
