@@ -31,21 +31,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=20
 
 # ── Hardening ──
-ProtectSystem=strict
-# Writable paths: the install root (versions/, current symlink, state.json,
-# credentials.json), and the runtime tmp dir. Everything else is read-only.
-ReadWritePaths=/opt/bilbycast/appear-x-gateway /var/lib/bilbycast/appear-x-gateway /run/bilbycast
-ProtectHome=true
-PrivateTmp=true
 NoNewPrivileges=true
-# No /dev/dri or /dev/snd — sidecars don't touch the GPU or audio
-# hardware. Only the manager-WS link + the JSON-RPC HTTPS link to the
-# Appear X chassis.
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictNamespaces=true
 RestrictRealtime=true
-LockPersonality=true
 SystemCallArchitectures=native
 
 # Resource limits. The gateway is light — 1 GB RSS is generous and
