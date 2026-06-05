@@ -54,6 +54,7 @@ src/
 ├── main.rs              # CLI (clap), config loading, SDK wiring, task spawning
 ├── config.rs            # TOML config parsing + validation
 ├── event_gate.rs        # 950/min client-side event rate-limiter
+├── upgrade_profile.rs   # Sigstore identity allowlist (repo + workflow) for self-upgrade
 └── appear_x/
     ├── mod.rs
     ├── jsonrpc.rs        # JSON-RPC 2.0 client (session mgmt, request builder)
@@ -61,6 +62,7 @@ src/
     ├── commands.rs       # AppearXCommandHandler (impl of SDK CommandHandler)
     ├── capabilities.rs   # Startup capability discovery
     ├── probe_registry.rs # Registry of per-card-family probe candidates
+    ├── reachability.rs   # ReachabilityState — target up/down tracking for gateway_target
     └── state.rs          # SharedAppearXState — consolidated polling snapshot
 ```
 
@@ -99,10 +101,15 @@ Handles the Appear X JSON-RPC 2.0 specifics:
 
 Spawns periodic polling tasks per configured board slot:
 
+All interface versions below are placeholders (`{ver}`): MMI versions
+are config-driven (`[polling]` defaults — alarms `2.8`, chassisModel
+`4.1`, cards `2.8`, uptime `5.6`); `ipGateway`/board versions are
+**negotiated per slot** from the probe list in `probe_registry.rs`.
+
 | Poll Target | JSON-RPC Method | Endpoint | Manager Message |
 |-------------|----------------|----------|-----------------|
-| Alarms | `mmi:2.16/alarms/GetActiveAlarms` | MMI | `health` (derives status from alarm severity) |
-| Chassis | `mmi:2.16/chassisModel/GetGraph` | MMI | `stats` |
+| Alarms | `mmi:{ver}/alarms/GetActiveAlarms` | MMI | `health` (derives status from alarm severity) |
+| Chassis | `mmi:{ver}/chassisModel/GetGraph` | MMI | `stats` |
 | IP Inputs | `ipGateway:{ver}/input/GetInputs` | Board | `stats` |
 | IP Outputs | `ipGateway:{ver}/output/GetOutputs` | Board | `stats` |
 | Services | `board:{ver}/services/GetInputServices` | Board | `stats` |
@@ -145,8 +152,15 @@ TOML config file. See `config/example.toml` for a complete template.
 |---------|---------|
 | `[manager]` | Manager WebSocket URL, auth credentials/token, TLS settings |
 | `[appear_x]` | Appear X unit address, login credentials, HTTPS settings |
-| `[polling]` | Polling intervals per data type |
-| `[[polling.boards]]` | Board slots to monitor (slot number, interface type, API version) |
+| `[polling]` | Polling intervals per data type, MMI interface versions, SFP thresholds |
+
+> **No per-board configuration.** Boards/slots are **auto-discovered at
+> runtime** by a startup capability-discovery pass
+> (`src/appear_x/capabilities.rs`): it reads `cards/GetChassisInfo` for
+> the chassis type and per-slot card details, then probes the registry
+> in `src/appear_x/probe_registry.rs` to learn which JSON-RPC interface
+> and version each populated slot speaks. There is no
+> `[[polling.boards]]` section.
 
 ### Key Settings
 
@@ -244,13 +258,16 @@ The Appear X platform uses:
 - **Symmetrical Get/Set** — GetInputs and SetInputs use identical data structures
 - **Slot numbering** in hexadecimal for board endpoints (slot 10 = "A")
 
-Key API modules used by this gateway:
-- `mmi:2.16/alarms` — Active alarm monitoring
-- `mmi:2.16/chassisModel` — Chassis graph (slots, boards, nodes, relations)
-- `ipGateway:1.15/input` — IP input configuration (UDP, multicast, seamless, analyze modes)
-- `ipGateway:1.15/output` — IP output configuration (raw, TS blacklist/whitelist, service multiplexing)
-- `ipGateway:1.15/ipinterface` — IP interface configuration (physical ports, addressing)
-- `board:2.16/services` — Input/output service reference system
+Key API modules used by this gateway (interface versions shown as
+`{ver}` — MMI versions are config-driven, defaulting to alarms `2.8` /
+chassisModel `4.1` / cards `2.8`; `ipGateway`/board versions are
+negotiated per slot via `probe_registry.rs`):
+- `mmi:{ver}/alarms` — Active alarm monitoring
+- `mmi:{ver}/chassisModel` — Chassis graph (slots, boards, nodes, relations)
+- `ipGateway:{ver}/input` — IP input configuration (UDP, multicast, seamless, analyze modes)
+- `ipGateway:{ver}/output` — IP output configuration (raw, TS blacklist/whitelist, service multiplexing)
+- `ipGateway:{ver}/ipinterface` — IP interface configuration (physical ports, addressing)
+- `board:{ver}/services` — Input/output service reference system
 
 ## Creating Additional Device Gateways
 
