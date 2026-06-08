@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-appear-x-api-gateway"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 description = "API gateway bridging Appear X platform JSON-RPC API to bilbycast-manager WebSocket protocol"
 license-file = "LICENSE"
