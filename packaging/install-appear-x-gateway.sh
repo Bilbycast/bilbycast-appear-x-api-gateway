@@ -232,6 +232,20 @@ if [[ -z "${ARTEFACT_URL}" || "${ARTEFACT_URL}" == "null" ]]; then
     exit 1
 fi
 
+# Defence-in-depth: the tarball SHA-256 is already pinned inside the
+# Sigstore-verified manifest, so a swapped artefact fails the hash check
+# below regardless. This host allowlist is a second layer — it stops a
+# (hypothetically tampered) manifest from pointing the download at a host
+# outside GitHub-controlled infrastructure. Mirrors install-relay.sh.
+ARTEFACT_HOST="$(awk -F[/:] '{ print $4 }' <<< "${ARTEFACT_URL}")"
+case "${ARTEFACT_HOST}" in
+    github.com|objects.githubusercontent.com) ;;
+    *)
+        echo "Manifest artefact URL host '${ARTEFACT_HOST}' is not in the allowlist." >&2
+        exit 1
+        ;;
+esac
+
 echo "Downloading ${ARTEFACT_URL}…"
 curl -fsSL -o release.tar.gz "${ARTEFACT_URL}"
 got_sha="$(sha256sum release.tar.gz | awk '{print $1}')"
@@ -368,7 +382,14 @@ echo
 echo "Waiting up to 60 s for bilbycast-appear-x-gateway to come up + register with the manager…"
 for _ in $(seq 1 30); do
     if systemctl is-active --quiet bilbycast-appear-x-gateway; then
-        echo "bilbycast-appear-x-gateway is up. Verify in the manager UI under /admin/nodes."
+        # NOTE: this sidecar has no local HTTP /health endpoint (it is a pure
+        # manager-WS client), so we can only confirm the *process* started —
+        # NOT that it authenticated + registered with the manager. Unlike the
+        # edge installer's `.manager.connected` poll, registration must be
+        # confirmed in the manager UI.
+        echo "bilbycast-appear-x-gateway process is up (this does NOT confirm"
+        echo "manager registration). Confirm the node is online in the manager"
+        echo "UI under /admin/nodes; if it doesn't appear, check the logs below."
         echo
         echo "Logs: journalctl -u bilbycast-appear-x-gateway -f"
         echo "Config: ${CONFIG_FILE}"
