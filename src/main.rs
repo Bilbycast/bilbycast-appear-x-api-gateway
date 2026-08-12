@@ -171,6 +171,12 @@ async fn main() -> Result<()> {
         node_secret: persisted.node_secret.clone(),
         registration_token: None,
         accept_self_signed_cert: cfg.manager.accept_self_signed_cert,
+        // Never plaintext. The SDK's `ws://` escape hatch (this field plus
+        // `BILBYCAST_SDK_ALLOW_PLAINTEXT_WS=1`) exists for its own
+        // integration tests; this sidecar carries a node secret to a
+        // production manager, so it is pinned off with no config surface
+        // to turn it on. Matches the wss://-only contract in README.md.
+        allow_plaintext_ws: false,
         cert_fingerprint: cfg.manager.cert_fingerprint.clone(),
         heartbeat_interval: std::time::Duration::from_secs(300),
         reconnect_backoff: Default::default(),
@@ -198,22 +204,22 @@ async fn main() -> Result<()> {
     // configured boot-health window, emitting `upgrade_completed` once.
     // Only spawned when upgrades are enabled — for `enabled = false`
     // operators the state machine never enters `PendingHealth`.
-    if let Some(ref up_cfg) = cfg.upgrade {
-        if up_cfg.enabled {
-            let install_root = up_cfg.install_root.clone();
-            let cfg_clone = up_cfg.clone();
-            let tx = upgrade_event_tx.clone();
-            let cancel = shutdown.clone();
-            tokio::spawn(upgrade::watchdog::run_watchdog_periodic(
-                install_root, cfg_clone, tx, cancel,
-            ));
+    if let Some(ref up_cfg) = cfg.upgrade
+        && up_cfg.enabled
+    {
+        let install_root = up_cfg.install_root.clone();
+        let cfg_clone = up_cfg.clone();
+        let tx = upgrade_event_tx.clone();
+        let cancel = shutdown.clone();
+        tokio::spawn(upgrade::watchdog::run_watchdog_periodic(
+            install_root, cfg_clone, tx, cancel,
+        ));
 
-            // Healthy-beat recorder: stamps `state.json.last_health_at`
-            // every 15 s so the periodic watchdog can promote
-            // `PendingHealth` → `Stable` once the boot-health window
-            // expires with continuous beats.
-            spawn_health_beat_recorder(up_cfg.install_root.clone(), shutdown.clone());
-        }
+        // Healthy-beat recorder: stamps `state.json.last_health_at`
+        // every 15 s so the periodic watchdog can promote
+        // `PendingHealth` → `Stable` once the boot-health window
+        // expires with continuous beats.
+        spawn_health_beat_recorder(up_cfg.install_root.clone(), shutdown.clone());
     }
 
     // Persist credentials after first-time registration.
