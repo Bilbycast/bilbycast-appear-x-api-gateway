@@ -1283,6 +1283,10 @@ fn spawn_pool_pollers(
 /// Different from the per-slot Xger pollers which gate on discovery;
 /// the pool surfaces are not in the discovery registry today, so we
 /// probe by attempting the call.
+// An RPC coordinate (service + method), the plumbing trio (client + state +
+// cancel), a cadence and a sink is what a poller-spawn helper is. Bundling
+// them into a struct would add a type without removing a decision.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pool_call<F>(
     client: &JsonRpcClient,
     state: &SharedAppearXState,
@@ -1325,6 +1329,7 @@ fn spawn_pool_call<F>(
 
 /// Spawn a per-slot Xger poller that extracts `result.data` as an array and
 /// calls the provided setter. No-op if the slot didn't discover the module.
+#[allow(clippy::too_many_arguments)] // see `spawn_pool_call`
 fn spawn_xger_slow<F>(
     slot_caps: &super::capabilities::SlotCapabilities,
     module: &'static str,
@@ -1422,6 +1427,7 @@ fn flatten_ip_interface_value(item: Value) -> Value {
 
 /// Like `spawn_xger_slow` but for commands whose result is a single opaque
 /// object instead of `{ data: [] }`. Gets the whole `result` blob.
+#[allow(clippy::too_many_arguments)] // see `spawn_pool_call`
 fn spawn_xger_slow_raw<F>(
     slot_caps: &super::capabilities::SlotCapabilities,
     module: &'static str,
@@ -1465,6 +1471,7 @@ fn spawn_xger_slow_raw<F>(
 /// idiom. Gates on the slot having actually discovered the
 /// `<interface>/<module>` pair so a chassis without that family silently
 /// skips spawning the task.
+#[allow(clippy::too_many_arguments)] // see `spawn_pool_call`
 fn spawn_iface_slow_raw<F>(
     slot_caps: &super::capabilities::SlotCapabilities,
     interface: &'static str,
@@ -1522,7 +1529,7 @@ fn derive_card_status_events(
 ) -> Vec<GatewayEvent> {
     let mut events = Vec::new();
 
-    let prev_ptp = prev.and_then(|p| ptp_state_of(p));
+    let prev_ptp = prev.and_then(ptp_state_of);
     let curr_ptp = ptp_state_of(curr);
     let (prev_locked, curr_locked) = (prev_ptp.as_deref() == Some("LOCKED"), curr_ptp.as_deref() == Some("LOCKED"));
     if prev.is_some() && prev_locked && !curr_locked {
@@ -1630,11 +1637,11 @@ fn min_rx_dbm(status: &Value) -> Option<f64> {
         for entry in arr {
             if let Some(rx) = entry.pointer("/value/diagnostics/value/rxPwr").and_then(|v| v.as_array()) {
                 for x in rx {
-                    if let Some(mw) = x.as_f64() {
-                        if mw > 0.0 {
-                            let dbm = 10.0 * mw.log10();
-                            m = Some(match m { Some(v) => v.min(dbm), None => dbm });
-                        }
+                    if let Some(mw) = x.as_f64()
+                        && mw > 0.0
+                    {
+                        let dbm = 10.0 * mw.log10();
+                        m = Some(match m { Some(v) => v.min(dbm), None => dbm });
                     }
                 }
             }

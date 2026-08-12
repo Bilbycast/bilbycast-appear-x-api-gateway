@@ -223,11 +223,15 @@ pub fn detect_hostname() -> Option<String> {
         let t = s.trim().to_string();
         if t.is_empty() { None } else { Some(t) }
     };
-    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        if let Some(t) = trim(s) { return Some(t); }
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        && let Some(t) = trim(s)
+    {
+        return Some(t);
     }
-    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-        if let Some(t) = trim(s) { return Some(t); }
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname")
+        && let Some(t) = trim(s)
+    {
+        return Some(t);
     }
     std::env::var("HOSTNAME").ok().and_then(trim)
 }

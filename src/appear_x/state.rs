@@ -926,6 +926,76 @@ fn extract_ptp_locked(status: &Value) -> (Option<bool>, Option<String>) {
 /// On cables without optical diagnostics (e.g. the 40 G active-cable QSFP on
 /// the X5 HEVC SDI testbed), `rxPwr` is `[0.0]` — a real dark optic reads
 /// `≤ -40 dBm`. We treat `rxPwr == 0.0` as "no optic present" and skip it.
+fn extract_sfp_signals(status: &Value) -> (Option<f64>, Option<f64>, Vec<Value>) {
+    let mut rx_min: Option<f64> = None;
+    let mut temp_max: Option<f64> = None;
+    let mut ports: Vec<Value> = Vec::new();
+
+    let qsfp_arr = status
+        .pointer("/qsfpStatus/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let sfp_arr = status
+        .pointer("/sfpStatus/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for entry in qsfp_arr.iter().chain(sfp_arr.iter()) {
+        let port_name = entry
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let diag = entry.pointer("/value/diagnostics/value");
+        let mut port_obj = serde_json::Map::new();
+        port_obj.insert("port".into(), json!(port_name));
+        if let Some(vendor) = entry.pointer("/value/vendorName").and_then(|v| v.as_str()) {
+            port_obj.insert("vendor".into(), json!(vendor.trim().to_string()));
+        }
+        if let Some(pn) = entry.pointer("/value/vendorPN").and_then(|v| v.as_str()) {
+            port_obj.insert("part_number".into(), json!(pn.trim().to_string()));
+        }
+        if let Some(sn) = entry.pointer("/value/vendorSN").and_then(|v| v.as_str()) {
+            port_obj.insert("serial".into(), json!(sn.trim().to_string()));
+        }
+        if let Some(d) = diag {
+            if let Some(temp) = d.get("temp").and_then(|v| v.as_f64()) {
+                port_obj.insert("temp_c".into(), json!(temp));
+                temp_max = Some(match temp_max {
+                    Some(v) => v.max(temp),
+                    None => temp,
+                });
+            }
+            if let Some(vcc) = d.get("vcc").and_then(|v| v.as_f64()) {
+                port_obj.insert("vcc_v".into(), json!(vcc));
+            }
+            if let Some(rx_arr) = d.get("rxPwr").and_then(|v| v.as_array()) {
+                let rx_values: Vec<f64> = rx_arr.iter().filter_map(|x| x.as_f64()).collect();
+                port_obj.insert("rx_power_mw".into(), json!(rx_values.clone()));
+                for mw in &rx_values {
+                    if *mw <= 0.0 {
+                        continue; // no optic present
+                    }
+                    let dbm = 10.0_f64 * mw.log10();
+                    rx_min = Some(match rx_min {
+                        Some(v) => v.min(dbm),
+                        None => dbm,
+                    });
+                }
+            }
+            if let Some(tx_arr) = d.get("txPwr").and_then(|v| v.as_array()) {
+                let tx_values: Vec<f64> = tx_arr.iter().filter_map(|x| x.as_f64()).collect();
+                port_obj.insert("tx_power_mw".into(), json!(tx_values));
+            }
+        }
+        ports.push(Value::Object(port_obj));
+    }
+
+    (rx_min, temp_max, ports)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,74 +1083,4 @@ mod tests {
         let global = signals.get("global").unwrap();
         assert_eq!(global.get("ptp_locked").unwrap().as_bool(), Some(false));
     }
-}
-
-fn extract_sfp_signals(status: &Value) -> (Option<f64>, Option<f64>, Vec<Value>) {
-    let mut rx_min: Option<f64> = None;
-    let mut temp_max: Option<f64> = None;
-    let mut ports: Vec<Value> = Vec::new();
-
-    let qsfp_arr = status
-        .pointer("/qsfpStatus/value")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let sfp_arr = status
-        .pointer("/sfpStatus/value")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    for entry in qsfp_arr.iter().chain(sfp_arr.iter()) {
-        let port_name = entry
-            .get("key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let diag = entry.pointer("/value/diagnostics/value");
-        let mut port_obj = serde_json::Map::new();
-        port_obj.insert("port".into(), json!(port_name));
-        if let Some(vendor) = entry.pointer("/value/vendorName").and_then(|v| v.as_str()) {
-            port_obj.insert("vendor".into(), json!(vendor.trim().to_string()));
-        }
-        if let Some(pn) = entry.pointer("/value/vendorPN").and_then(|v| v.as_str()) {
-            port_obj.insert("part_number".into(), json!(pn.trim().to_string()));
-        }
-        if let Some(sn) = entry.pointer("/value/vendorSN").and_then(|v| v.as_str()) {
-            port_obj.insert("serial".into(), json!(sn.trim().to_string()));
-        }
-        if let Some(d) = diag {
-            if let Some(temp) = d.get("temp").and_then(|v| v.as_f64()) {
-                port_obj.insert("temp_c".into(), json!(temp));
-                temp_max = Some(match temp_max {
-                    Some(v) => v.max(temp),
-                    None => temp,
-                });
-            }
-            if let Some(vcc) = d.get("vcc").and_then(|v| v.as_f64()) {
-                port_obj.insert("vcc_v".into(), json!(vcc));
-            }
-            if let Some(rx_arr) = d.get("rxPwr").and_then(|v| v.as_array()) {
-                let rx_values: Vec<f64> = rx_arr.iter().filter_map(|x| x.as_f64()).collect();
-                port_obj.insert("rx_power_mw".into(), json!(rx_values.clone()));
-                for mw in &rx_values {
-                    if *mw <= 0.0 {
-                        continue; // no optic present
-                    }
-                    let dbm = 10.0_f64 * mw.log10();
-                    rx_min = Some(match rx_min {
-                        Some(v) => v.min(dbm),
-                        None => dbm,
-                    });
-                }
-            }
-            if let Some(tx_arr) = d.get("txPwr").and_then(|v| v.as_array()) {
-                let tx_values: Vec<f64> = tx_arr.iter().filter_map(|x| x.as_f64()).collect();
-                port_obj.insert("tx_power_mw".into(), json!(tx_values));
-            }
-        }
-        ports.push(Value::Object(port_obj));
-    }
-
-    (rx_min, temp_max, ports)
 }
