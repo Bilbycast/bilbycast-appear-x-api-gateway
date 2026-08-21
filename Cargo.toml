@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-appear-x-api-gateway"
-version = "0.11.7"
+version = "0.11.8"
 edition = "2024"
 description = "API gateway bridging Appear X platform JSON-RPC API to bilbycast-manager WebSocket protocol"
 license-file = "LICENSE"
@@ -11,16 +11,16 @@ publish = false
 # Emitter). Owns every byte on the wire to the manager.
 bilbycast-gateway-sdk = { path = "../bilbycast-gateway-sdk" }
 
-tokio = { version = "1.52.1", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-reqwest = { version = "0.13.3", features = ["json", "rustls"], default-features = false }
-toml = "1.1.2"
-clap = { version = "4.6.1", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+reqwest = { version = "0.13.4", features = ["json", "rustls"], default-features = false }
+toml = "1.1.4"
+clap = { version = "4.6.6", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-chrono = { version = "0.4.44", features = ["serde"] }
-uuid = { version = "1.23.1", features = ["v4"] }
-anyhow = "1.0.102"
-async-trait = "0.1.89"
-tokio-util = { version = "0.7.18", features = ["rt"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["v4"] }
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+tokio-util = { version = "0.7.19", features = ["rt"] }
