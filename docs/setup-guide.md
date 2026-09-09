@@ -55,7 +55,7 @@ cards_interval_secs = 30
 capability-discovery pass and spawns per-slot pollers automatically
 based on what each card's firmware actually exposes.
 
-## Step 3: Run the Gateway
+## Step 3: Run the Gateway (development)
 
 ```bash
 # Debug mode
@@ -75,6 +75,41 @@ On first run, the gateway will:
 6. Begin polling
 
 On subsequent runs, it uses the saved credentials for reconnection (no token needed).
+
+## Step 3a: Install as a Service (production)
+
+Running the binary out of `target/` is a development convenience. For a real
+deployment take one of two routes — do not hand-roll a third:
+
+- **Scripted**: `packaging/install-appear-x-gateway.sh`, published as a release
+  asset and run curl-pipe-bash. It verifies the release manifest with cosign
+  against the gateway's own Sigstore identity allowlist, checks the tarball
+  SHA-256, creates the `bilbycast-gateway` system account (distinct from the
+  edge's `bilbycast`, so both can share a host), lays out
+  `/opt/bilbycast/appear-x-gateway/{versions/<v>/, current, config.toml,
+  credentials.json}`, writes the initial `config.toml` from the flags you
+  pass, and installs + enables the systemd unit:
+
+  ```bash
+  curl -fsSL https://github.com/Bilbycast/bilbycast-appear-x-api-gateway/releases/latest/download/install-appear-x-gateway.sh \
+    | sudo bash -s -- \
+        --manager wss://manager.example.com:8443/ws/node \
+        --registration-token <token-from-step-1> \
+        --appear-x-address 192.168.1.100 \
+        --appear-x-username admin \
+        --appear-x-password <chassis-password>
+  ```
+
+  One sidecar process per Appear X chassis.
+
+- **Manual**: the step-by-step systemd walkthrough at
+  <https://bilbycast.com/appear-x-gateway/setup-guide/> lays out the same
+  paths by hand. It is not duplicated here.
+
+The same layout is what `upgrade_binary` writes into — a staged upgrade drops a
+new `versions/<v>/`, swaps `current`, and records the install in a `state.json`
+next to them — so a service install is also the prerequisite for
+manager-driven remote upgrades.
 
 ## Step 4: Verify in Manager
 
@@ -114,4 +149,4 @@ RUST_LOG=info,bilbycast_appear_x_api_gateway=trace cargo run -- --config config.
 | "Authentication failed" | Wrong token/credentials | Check registration token or re-register |
 | "BeginSession failed" | Wrong Appear X credentials | Verify username/password in config |
 | Node shows offline in manager | Network/firewall issue | Check connectivity to manager wss:// port |
-| No stats appearing | Polling misconfigured | Check board slot numbers and API version |
+| No stats appearing | Chassis unreachable, or the firmware exposes interfaces the probe registry doesn't know | Run `bilbycast-appear-x-api-gateway --config config.toml probe` and compare the discovered modules against `src/appear_x/probe_registry.rs` |

@@ -106,14 +106,43 @@ are config-driven (`[polling]` defaults — alarms `2.8`, chassisModel
 `4.1`, cards `2.8`, uptime `5.6`); `ipGateway`/board versions are
 **negotiated per slot** from the probe list in `probe_registry.rs`.
 
+`run_polling` wires 4 chassis-wide MMI pollers, 6 chassis-wide pool pollers and
+**up to 42 more per discovered slot** — 52 tasks on a single-card chassis, and
+42 more for every additional slot. Every per-slot task is gated on the discovery
+pass having actually found that interface/module pair, so a bare X5 HEVC SDI
+silently spawns a fraction of the list:
+
 | Poll Target | JSON-RPC Method | Endpoint | Manager Message |
 |-------------|----------------|----------|-----------------|
-| Alarms | `mmi:{ver}/alarms/GetActiveAlarms` | MMI | `health` (derives status from alarm severity) |
+| Alarms | `mmi:{ver}/alarms/GetActiveAlarms` | MMI | `health` (derives status from alarm severity; also the reachability heartbeat) |
 | Chassis | `mmi:{ver}/chassisModel/GetGraph` | MMI | `stats` |
-| IP Inputs | `ipGateway:{ver}/input/GetInputs` | Board | `stats` |
-| IP Outputs | `ipGateway:{ver}/output/GetOutputs` | Board | `stats` |
-| Services | `board:{ver}/services/GetInputServices` | Board | `stats` |
+| Chassis uptime | `mmi:{ver}/uptime/GetSystemUptime` | MMI | `stats` |
+| Card inventory | `mmi:{ver}/cards/GetChassisInfo` + `/cards/GetCardStates` (one task, two calls) | MMI | `stats` |
+| IP Inputs / Outputs | `ipGateway:{ver}/input/GetInputs`, `/output/GetOutputs` | Board | `stats` |
+| IP input / output status | `ipGateway:{ver}/status/GetIpInputStatus`, `/status/GetIpOutputStatus` — the output call falls back to `/status/GetOutputStatus` when the firmware answers "not found" | Board | `stats` |
+| SRT status | `ipGateway:{ver}/status/GetSrtInputStatus`, `/status/GetSrtOutputStatus` | Board | `stats` |
+| Physical / virtual ports | `ipGateway:{ver}/physicalports/GetPhysicalPorts`, `/physicalports/GetVirtualPorts` | Board | `stats` |
+| Alarm triggers | `ipGateway:{ver}/triggers/GetTriggers` | Board | `stats` |
 | IP Interfaces | `ipGateway:{ver}/ipinterface/GetIpInterfaces` | Board | `stats` |
+| Card status | `Xger:{ver}/cardStatus/GetCardStatus` | Board | `stats` + the PTP lock and SFP RX-power / cage-temperature events (see below) |
+| Xger config modules | `Xger:{ver}/{coderService,multiService,audioProfile,ipInterface,cardAllocation,ipConnection,redundancyGroup}/Get*` | Board | `stats` |
+| Xger status modules | `Xger:{ver}/{redundancyGroupStatus,dpiStatus,esamStatus,poisServerStatus,poolConfig,lockStatus,psiStatus}/Get*` | Board | `stats` |
+| PTP / system time | `TimeX:{ver}/cardPtp/GetPtpStatus`, `/cardPtp/GetPtpSettings`, `TimeX:{ver}/systemTimeSettings/GetSystemTimeStatus` | Board | `stats` |
+| SDI card family | `sdi:{ver}/portstatus/GetPortStatus`, `/cardinfo/GetCardInfo`, `/physicalports/GetPhysicalPorts` | Board | `stats` |
+| HIP encoder / decoder config | `hipEnc`/`hipTsEnc:{ver}/hip[Ts]Encoder/GetEncoders`, `hipDec`/`hipTsDec:{ver}/hip[Ts]Decoder/GetDecoders` | Board | `stats` |
+| HIP transport status | `hipEnc`/`hipTsEnc:{ver}/hipEncStatus/GetEncoderTransportStatus`, `hipDec`/`hipTsDec:{ver}/hipDecStatus/GetDecoderStatus`, `hipEnc:{ver}/hipNetworkStatus/GetNetworkStatus` | Board | `stats` |
+| Services | `board:{ver}/services/GetInputServices` + `/services/GetOutputServices` | Board | `stats` |
+| Pool profiles | `Xger:2.55/{videoProfile,audioProfile,coderService,testGeneratorProfile}/Get*` on `encoderpool`; `{videoProfile,coderService}` on `decoderpool` | Service (`/mmi/service_{encoderpool,decoderpool}/`) | `stats` |
+
+The pool version is the one hard-coded `Xger:2.55` in the file — pool services
+sit outside the per-slot probe, so nothing negotiates it.
+
+**Card-status events.** `Xger:{ver}/cardStatus/GetCardStatus` is diffed against
+its previous snapshot (`derive_card_status_events`) and emits edge-triggered
+events: Critical `ptp` on `LOCKED` → anything else and Info on the way back,
+Minor `sfp` when the minimum RX optical power crosses below
+`sfp_low_rx_dbm_threshold` or the maximum cage temperature crosses above
+`sfp_high_temp_c_threshold`, each with an Info recovery on the reverse crossing.
 
 Health status derivation: `MAJOR`/`CRITICAL` alarms → "critical", `MINOR`/`WARNING` → "degraded", no alarms → "ok".
 
@@ -123,7 +152,10 @@ Health status derivation: `MAJOR`/`CRITICAL` alarms → "critical", `MINOR`/`WAR
 
 ### Command Handler (`appear_x/commands.rs`)
 
-Translates manager commands into Appear X JSON-RPC calls:
+Translates manager commands into Appear X JSON-RPC calls. One match in
+`commands.rs` dispatches **76 action strings** onto a catch-all
+`unknown_action` arm. The table below is the ipGateway core; the rest group
+by family:
 
 | Manager Command | Appear X Method | Notes |
 |----------------|-----------------|-------|
@@ -137,6 +169,21 @@ Translates manager commands into Appear X JSON-RPC calls:
 | `set_ip_output` | `SetOutputs` | Write — requires `slot` and `outputs` fields |
 
 Write commands follow the Appear X Get/Set symmetry pattern: the data structures for GetInputs and SetInputs are identical.
+
+The other 68 arms, by family. Every per-slot family below (ipGateway, TimeX,
+Xger, HIP, splicing) resolves the interface version the discovery pass
+negotiated for that slot and fails with `unsupported_on_card` when the slot
+doesn't expose the module; the MMI arms are chassis-wide `call_mmi` at the
+config-driven `[polling]` versions, and `upgrade_binary` never touches the
+chassis at all:
+
+- **ipGateway** — `get_ip_input_status`, `get_ip_output_status`, `get_srt_input_status`, `get_srt_output_status`, `get_pid_status`, `get_physical_ports`, `get_virtual_ports`, `get_triggers`
+- **MMI** — `get_alarm_history`, `get_registered_alarms`, `get_all_alarm_overrides` / `set_alarm_overrides` / `delete_alarm_overrides`, and the licensing set `get_features_info` / `get_license` / `get_hardware_id` / `install_license`
+- **TimeX** — `get_ptp_status`, `get_ptp_settings` / `set_ptp_settings`, `get_card_ptp_capabilities`, `get_system_time_status`, `get_system_time_settings` / `set_system_time_settings`, `get_current_utc_time`
+- **Xger card manager** — `get_card_status`, `get_images`, `get_pool_config` / `set_pool_config`, `get_lock_status`, `get_psi_status`, `get_card_allocations` / `set_card_allocations`, `get_redundancy_group_status`, plus get/set/delete triples for coder services, multi services, audio profiles, Xger IP interfaces, IP connections and redundancy groups
+- **HIP encoders / decoders** — `get_hip_encoders` / `set_hip_encoders`, `get_hip_decoders` / `set_hip_decoders`, and `clear_all_counters`, which routes to `hipTsEnc` or `hipEnc`'s `hipEncStatus` module (it is *not* on the Xger surface, despite Xger being where most slot-level probing happens)
+- **Splicing (DPI / ESAM / SCTE-35)** — `get_dpi` / `set_dpi`, `get_dpi_status`, `get_esam_config` / `set_esam_config`, `get_esam_status`, `get_pois_server_status`, `get_scte35_config` / `set_scte35_config`, `get_scte35_history` (on-demand splice-log fetch with optional `limit` / `since_pts`)
+- **Sidecar** — `upgrade_binary` (see [Remote upgrade](#remote-upgrade))
 
 ### "Open Device Web UI" launch (operator-configured URL)
 
@@ -175,6 +222,7 @@ TOML config file. See `config/example.toml` for a complete template.
 | `appear_x.username` | Yes | — | JSON-RPC login username |
 | `appear_x.password` | Yes | — | JSON-RPC login password |
 | `appear_x.accept_self_signed_cert` | No | `true` | Accept Appear X self-signed HTTPS certs |
+| `appear_x.cert_fingerprint` | No | — | SHA-256 pin for the chassis HTTPS cert (64 hex chars, `:` separators optional, normalised at load). When set, full CA-chain validation runs **and** the leaf fingerprint must match; it takes precedence over `accept_self_signed_cert` and — unlike the blanket self-signed path — needs no `BILBYCAST_ALLOW_INSECURE` |
 | `appear_x.reachability_failure_threshold` | No | `2` | Consecutive failed alarm polls before flipping `gateway_target.reachable` to `false` |
 | `appear_x.reachability_event_dwell_secs` | No | `60` | Minimum dwell time (seconds) in the new reachability state before firing a `target_unreachable` / `target_recovered` event |
 
@@ -188,7 +236,8 @@ TOML config file. See `config/example.toml` for a complete template.
 ## Manager-Side Requirements
 
 The gateway requires a matching driver registered in bilbycast-manager:
-- **Driver**: `manager-core/src/drivers/appear_x.rs` (`AppearXDriver`)
+- **Driver**: `bilbycast-manager/crates/device-appear-x/` (`AppearXDriver`), its own plugin crate — `manager-core/src/drivers/mod.rs` holds the `DeviceDriver` trait, the `DriverRegistry` and the descriptor types they share, never a per-device implementation. Registered in `crates/manager-server/src/main.rs` alongside `EdgeDriver` / `RelayDriver`
+- **Driver UI**: `crates/manager-server/src/ui/static/js/devices/appear_x/` (`index.js` + `editor.js`, vanilla JS, `include_str!`d into the binary)
 - **Device type**: `"appear_x"`
 - **Registration**: Create a node in the manager with `device_type: "appear_x"`, copy the registration token to the gateway config
 
@@ -200,10 +249,18 @@ The driver provides:
 
 ### Scale-out alignment with manager's Phase 1-5 changes
 
-The gateway speaks `WS_PROTOCOL_VERSION = 1` and the manager has
-not bumped that constant, so every manager-side scale-out change
-is transparent on the wire. For completeness, the manager-side
-deltas that matter for this sidecar:
+The gateway speaks `GATEWAY_WS_PROTOCOL_VERSION = 1` (pinned in
+`bilbycast-gateway-sdk/src/envelope.rs` and sent in the auth frame);
+the manager is at `WS_PROTOCOL_VERSION = 4`. The gap is safe on the
+wire — both sides dispatch unknown message types on a catch-all arm,
+new fields are `#[serde(default)] + Option`, and the manager does not
+reject the connection — but it is **not silent**: `ws/node_hub.rs`
+logs a warning *and* inserts a Warning `compatibility` event against
+the node on every successful auth, so an appear_x node accrues one
+Events-page row per connect/reconnect until the SDK constant is
+aligned. Beyond that, every manager-side scale-out change is
+transparent to this sidecar. For completeness, the manager-side
+deltas that matter here:
 
 - **manager_urls[]** (replaces scalar `manager.url`). Config now
   takes a list of up to 16 `wss://` URLs. The gateway delegates
@@ -262,12 +319,23 @@ Key API modules used by this gateway (interface versions shown as
 `{ver}` — MMI versions are config-driven, defaulting to alarms `2.8` /
 chassisModel `4.1` / cards `2.8`; `ipGateway`/board versions are
 negotiated per slot via `probe_registry.rs`):
-- `mmi:{ver}/alarms` — Active alarm monitoring
+- `mmi:{ver}/alarms` — Active alarm monitoring (plus history, registered alarms, overrides)
 - `mmi:{ver}/chassisModel` — Chassis graph (slots, boards, nodes, relations)
+- `mmi:{ver}/cards` — Chassis info + per-slot card states (drives discovery)
+- `mmi:{ver}/uptime` — System uptime
+- `mmi:{ver}/license` — Feature info, licence, hardware ID, licence install
 - `ipGateway:{ver}/input` — IP input configuration (UDP, multicast, seamless, analyze modes)
 - `ipGateway:{ver}/output` — IP output configuration (raw, TS blacklist/whitelist, service multiplexing)
+- `ipGateway:{ver}/status` — Live IP + SRT input/output status and PID status
+- `ipGateway:{ver}/physicalports` — Physical + virtual port inventory and SFP diagnostics
+- `ipGateway:{ver}/triggers` — Alarm-trigger configuration snapshot
 - `ipGateway:{ver}/ipinterface` — IP interface configuration (physical ports, addressing)
+- `Xger:{ver}/*` — Card-manager surface: `cardStatus`, `coderService`, `multiService`, `audioProfile`, `ipInterface`, `cardAllocation`, `ipConnection`, `redundancyGroup[Status]`, `poolConfig`, `lockStatus`, `psiStatus`, `dpiStatus`, `esamStatus`, `poisServerStatus`
+- `TimeX:{ver}/cardPtp` + `/systemTimeSettings` — Card PTP state/settings/capabilities and chassis system time
+- `sdi:{ver}/*` — SDI card family: `portstatus`, `cardinfo`, `physicalports`
+- `hipEnc` / `hipTsEnc` / `hipDec` / `hipTsDec:{ver}/*` — Encoder/decoder runtime config, transport status, network counters
 - `board:{ver}/services` — Input/output service reference system
+- `Xger:2.55/*` on `encoderpool` / `decoderpool` — Chassis-wide video/audio/coder/test-generator profiles (version pinned, not negotiated)
 
 ## Creating Additional Device Gateways
 
@@ -277,7 +345,7 @@ To create a gateway for another 3rd-party device, depend on `bilbycast-gateway-s
 2. Build a `GatewayConfig` from your TOML `[manager]` section
 3. Implement `bilbycast_gateway_sdk::CommandHandler` — this is your vendor translation layer
 4. Spawn your polling task with the `Emitter` returned by `client.emitter()`
-5. Create a matching driver in `bilbycast-manager/crates/manager-core/src/drivers/`
-6. Register the driver in `bilbycast-manager/crates/manager-server/src/main.rs`
+5. Create a plugin crate `bilbycast-manager/crates/device-<name>/` implementing `DeviceDriver`, plus a UI module under `crates/manager-server/src/ui/static/js/devices/<name>/`
+6. Register the driver in `bilbycast-manager/crates/manager-server/src/main.rs` (full walkthrough: `bilbycast-manager/docs/adding-a-device-type.md`)
 
 All WebSocket / TLS / auth / reconnect / heartbeat / command-ack wiring is owned by the SDK — the gateway only implements the vendor API client, polling loop, and `CommandHandler`.

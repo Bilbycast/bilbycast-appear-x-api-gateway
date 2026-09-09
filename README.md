@@ -73,14 +73,30 @@ The node should appear as **online** in the manager dashboard. Stats (inputs, ou
 
 See `config/example.toml` for a complete template.
 
-## CLI Options
+## CLI
 
 ```
-bilbycast-appear-x-api-gateway [OPTIONS]
+bilbycast-appear-x-api-gateway [OPTIONS] [COMMAND]
+
+Commands:
+  run      Run the gateway (default — this is what you get with no command)
+  probe    Connect to the Appear X unit only and exercise each polling call once
 
 Options:
   -c, --config <PATH>    Path to TOML configuration file [default: config.toml]
   -h, --help             Print help
+```
+
+`--config` is global, so it applies to either command.
+
+### `probe`
+
+`probe` talks to the chassis and nothing else — it never opens a manager connection. It authenticates, fires the four chassis-wide MMI polls once each — alarms, chassis graph, `cards/GetChassisInfo`, `cards/GetCardStates` — with a PASS/FAIL line and a truncated response body per call, then runs per-slot capability discovery and prints what each card reports: chassis type, the negotiated `cards/*` MMI version, per-slot name/serial/software, and the modules the probe registry matched (naming `src/appear_x/probe_registry.rs` when a firmware's namespace is not registered yet). It finishes with a one-shot Xger health snapshot per slot — PTP lock, worst SFP RX optical power, max SFP temperature, plus an OK/ERR line per probed module. It is the fastest way to answer "are my credentials right and which interface versions does this firmware expose?".
+
+Because it never reaches the manager, `probe` skips the manager-URL validation the gateway normally does at load time — so it works from a config file whose `manager.urls` is empty or not yet decided, before a manager exists.
+
+```bash
+bilbycast-appear-x-api-gateway --config config.toml probe
 ```
 
 ## Documentation

@@ -104,17 +104,23 @@ api_key = "..."
 
 ## Step 2: Create the Manager Driver
 
-### Driver File
+### Driver Crate
 
-Create `bilbycast-manager/crates/manager-core/src/drivers/<device>.rs`:
+A driver is its own workspace crate, not a module inside `manager-core`. `manager-core/src/drivers/mod.rs` holds only the `DeviceDriver` trait and the registry; every driver lives in `bilbycast-manager/crates/device-<device>/` (`device-edge`, `device-relay`, `device-appear-x` today).
+
+Create `bilbycast-manager/crates/device-<device>/` with a `Cargo.toml` that depends on `manager-core`, add it to `members` in the workspace `Cargo.toml`, and add it to `crates/manager-server/Cargo.toml`'s dependencies. Then in `crates/device-<device>/src/lib.rs`:
 
 ```rust
-use super::{
+use manager_core::drivers::{
     ActionCategory, ActionUiHints, AiActionDescriptor, AiDeviceContext,
     CommandDescriptor, DeviceDriver, DeviceMetricsSummary,
 };
 
 pub struct MyDeviceDriver;
+
+impl MyDeviceDriver {
+    pub fn new() -> Self { Self }
+}
 
 impl DeviceDriver for MyDeviceDriver {
     fn device_type(&self) -> &str { "<device>" }
@@ -160,13 +166,19 @@ For `SimpleAction` category (buttons):
 
 ### Register the Driver
 
-Add to `bilbycast-manager/crates/manager-server/src/main.rs`:
+Registration is one line, next to the existing three in `bilbycast-manager/crates/manager-server/src/main.rs` (`// Build device driver registry`):
 
 ```rust
-driver_registry.register(Arc::new(manager_core::drivers::<device>::MyDeviceDriver::new()));
+driver_registry.register(Arc::new(device_<device>::MyDeviceDriver::new()));
 ```
 
-Add `pub mod <device>;` to `manager-core/src/drivers/mod.rs`.
+There is nothing to add to `manager-core/src/drivers/mod.rs` — it declares no per-device modules.
+
+### Per-Driver UI
+
+The manager's UI is vanilla JS `include_str!`'d into the binary, with one plugin directory per device type at `crates/manager-server/src/ui/static/js/devices/<device>/`. Copy `_example/`, then add an `import` line for it to `devices/index.js` so its `registerDevicePlugin()` side-effect runs at page load. Because the tree is embedded rather than served from disk, each new file also needs an `include_str!` const *and* a matching `/static/js/devices/<device>/…` route in `crates/manager-server/src/ui/mod.rs` — without both the import 404s and the plugin never registers. The manager serves an enforcing `script-src 'self'` CSP, so no inline `<script>`, no `on*=` attributes (including inside `innerHTML` strings), no `eval`, and no cross-origin fetch — a violation breaks the page rather than filing a report.
+
+`bilbycast-manager/docs/adding-a-device-type.md` is the authoritative walkthrough for all of this; the steps here are the gateway-side summary.
 
 ## Step 3: Test End-to-End
 

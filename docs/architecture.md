@@ -49,8 +49,26 @@ is purely the vendor translation layer on top of that SDK.
 6. The handler returns `Result<Value, CommandError>`; the SDK serialises that into a `command_ack` (preserving `error_code`) and sends it back to the manager
 7. Manager forwards the result to the UI
 
-`CommandError::code` rides on `command_ack.error_code`. The gateway uses the
-shared taxonomy: `validation_error`, `unknown_action`, `vendor_api_error`.
+`CommandError::code` rides on `command_ack.error_code`. Three codes come from
+the shared taxonomy, and the gateway adds its own — the set is open, not closed:
+
+- `validation_error` — a required field is missing or malformed (`require_field`)
+- `unknown_action` — the action type has no arm in the handler
+- `vendor_api_error` — any failed chassis JSON-RPC call, funnelled through
+  `vendor_error()` so every vendor-side failure lands on one code
+- `unsupported_on_card` — the slot's discovered interface set lacks the module
+  the action needs (X5 / X10 / X20 chassis speak only the Xger card-manager
+  surface, so `ipGateway/*` actions are refused here rather than leaking a
+  "Method not found" from the unit)
+- `discovery_in_progress` — the command arrived before startup capability
+  discovery completed; the chassis may be unreachable. Commands are accepted
+  once the sidecar can talk to the unit
+- `upgrade_*` — the `upgrade_binary` path returns `upgrade_disabled` when
+  `config.toml` has no `[upgrade]` section, `upgrade_version_invalid` /
+  `upgrade_channel_not_allowed` on a malformed request, and otherwise forwards
+  the SDK's `upgrade::error_codes` verbatim from `UpgradeCoordinator::stage`.
+  See [`writing-a-gateway.md`](../../bilbycast-gateway-sdk/docs/writing-a-gateway.md)
+  §9a for that whole set
 
 ### Health Derivation
 
