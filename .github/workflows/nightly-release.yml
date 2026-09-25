@@ -257,8 +257,13 @@ jobs:
           path: bilbycast-gateway-sdk
           persist-credentials: false
 
+      # v8, like the edge release, which pairs it with upload-artifact@v7 as
+      # this workflow does. v8 fails the job when a download's digest does not
+      # match the one the upload recorded (v7 only warned), which matters here:
+      # build-manifest.sh copies each tarball's SHA-256 from its `.sha256`
+      # sidecar rather than hashing the tarball, and cosign signs the result.
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
