@@ -23,14 +23,20 @@ on:
     tags:
       - "v*"
 
+# Read-only by default. Only the `release` job below is granted more, because
+# it is the only job that needs more. Both of its grants are worth more than
+# they look, which is why they are not handed to every job:
+#   - `id-token: write` mints a Fulcio certificate whose subject is this
+#     workflow file at the tag (`nightly-release.yml@refs/tags/v*`), not the
+#     job. That is exactly the identity `ALLOWED_SIGNERS` in
+#     `src/upgrade_profile.rs` trusts on every deployed gateway, so any step
+#     holding it can sign a manifest the gateway's upgrade pipeline accepts.
+#   - `contents: write` can create and delete releases and tags.
+# At workflow level both reached `build` too, where every dependency's
+# build.rs and proc-macro runs and where a third-party action installs the
+# toolchain. `check-version` and `build` only read the repository.
 permissions:
-  contents: write
-  # Required for Sigstore keyless signing — Fulcio mints a short-lived
-  # cert against the workflow run's OIDC identity. The gateway's
-  # `ALLOWED_SIGNERS` allowlist (in `src/upgrade_profile.rs`) pins this
-  # exact workflow path; a typo here will fail the signature check on
-  # every running gateway.
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +51,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          # Nothing in this job pushes. `gh release view` below reads the
+          # repository from the `origin` remote, which is still configured,
+          # and authenticates with GH_TOKEN, not the git credential.
+          persist-credentials: false
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -84,16 +95,21 @@ jobs:
             artifact_suffix: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
+      # Nothing in this job pushes, and without `persist-credentials: false`
+      # the job's token stays in each checkout's .git/config for every later
+      # step, `cargo build` included.
       - name: Checkout bilbycast-gateway-sdk (path dependency)
         uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-gateway-sdk
           path: bilbycast-gateway-sdk
+          persist-credentials: false
 
       - name: Checkout bilbycast-appear-x-api-gateway
         uses: actions/checkout@v5
         with:
           path: bilbycast-appear-x-api-gateway
+          persist-credentials: false
 
       - name: Install musl tools
         run: |
@@ -188,10 +204,28 @@ jobs:
     needs: [check-version, build]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
+    # The only job granted more than read (see the top-level block).
+    #   - id-token: write for `cosign sign-blob` (Sigstore keyless: the
+    #     runner's OIDC token buys the Fulcio certificate). `ALLOWED_SIGNERS`
+    #     in `src/upgrade_profile.rs` pins this exact workflow path, so a
+    #     rename or typo here fails the signature check on every running
+    #     gateway.
+    #   - contents: write for `git push origin <tag>` on a manual dispatch,
+    #     `gh release create` with its assets, and `gh release delete
+    #     --cleanup-tag` when pruning.
+    # download-artifact reads this run's artefacts with the runner's own
+    # token, not this one, so it needs no `actions` grant.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       # Checkout into a named subdir so the packaging/ + LICENSE refs
       # in `gh release create` below resolve. Matches the build job's
       # checkout layout for consistency.
+      #
+      # Credentials stay persisted here, unlike every other checkout in this
+      # workflow: a manual `workflow_dispatch` run creates the tag and pushes
+      # it with them.
       - name: Checkout bilbycast-appear-x-api-gateway
         uses: actions/checkout@v5
         with:
@@ -199,12 +233,14 @@ jobs:
 
       # The shared manifest builder lives in the SDK repo so every
       # vendor sidecar uses the same canonicalisation logic. Pull it
-      # into the runner so the build step below can call it.
+      # into the runner so the build step below can call it. Nothing here
+      # pushes to it, so its checkout keeps no credential.
       - name: Checkout bilbycast-gateway-sdk (manifest script)
         uses: actions/checkout@v5
         with:
           repository: Bilbycast/bilbycast-gateway-sdk
           path: bilbycast-gateway-sdk
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
