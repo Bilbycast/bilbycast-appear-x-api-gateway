@@ -111,6 +111,27 @@ new `versions/<v>/`, swaps `current`, and records the install in a `state.json`
 next to them — so a service install is also the prerequisite for
 manager-driven remote upgrades.
 
+> **A gateway on v0.11.12 or earlier cannot be upgraded from the manager.**
+> From v0.11.7 the SDK's identity check read the repository from the deprecated
+> Fulcio extension (`Bilbycast/bilbycast-appear-x-api-gateway`) and compared it
+> with the allowlist's `https://github.com/Bilbycast/bilbycast-appear-x-api-gateway`,
+> so every genuine release was refused with `upgrade_identity_not_allowed`;
+> older gateways failed earlier, with `upgrade_signature_invalid`. Both failed
+> closed, but the fix is in the new binary, so move the gateway to the first
+> release after v0.11.12 **once** by hand. A plain re-run of the scripted
+> install stops at its "Already installed" guard; pass `--upgrade-installer`,
+> which installs the latest release and points `current` at it, then restart:
+>
+> ```bash
+> curl -fsSL https://github.com/Bilbycast/bilbycast-appear-x-api-gateway/releases/latest/download/install-appear-x-gateway.sh \
+>   | sudo bash -s -- --upgrade-installer
+> sudo systemctl restart bilbycast-appear-x-gateway
+> ```
+>
+> The gateway accepts manager-driven upgrades from then on. The manager UI's
+> release list covers edges only, so name the version explicitly:
+> `POST /api/v1/nodes/{id}/upgrade {"version": "<x.y.z>", "channel": "stable"}`.
+
 ## Step 4: Verify in Manager
 
 1. The node should appear as **online** on the manager dashboard
