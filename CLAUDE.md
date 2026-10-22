@@ -79,12 +79,12 @@ The gateway delegates every manager-facing byte to the shared SDK crate. The SDK
   - Registration: `{"type": "auth", "payload": {"registration_token": "...", "software_version": "...", "device_type": "appear_x", "protocol_version": 1}}`
   - Reconnection: `{"type": "auth", "payload": {"node_id": "...", "node_secret": "...", "software_version": "...", "device_type": "appear_x", "protocol_version": 1}}`
 - **10-second auth timeout**
-- **A bounded link**: a 30 s dial deadline (DNS, TCP, TLS and the upgrade, with Happy-Eyeballs across the manager's addresses), 10 s to write the auth frame, a silence watchdog learned from the manager's pings (never under 90 s), 300 s on every write and 2 s for the Close at shutdown — so a stalled manager can no longer strand the gateway offline until a restart (the bilbycast-edge#180 failure). See the SDK's `docs/writing-a-gateway.md` §5a.
+- **A bounded link**: a 30 s dial deadline (DNS, TCP, TLS and the upgrade, with Happy-Eyeballs across the manager's addresses), 10 s to write the auth frame, a silence watchdog learned from the manager's pings (never under 90 s), 300 s on every write, 2 s for the Close at shutdown and then up to 30 s for a command already running to finish — so a stalled manager can no longer strand the gateway offline until a restart (the bilbycast-edge#180 failure). See the SDK's `docs/writing-a-gateway.md` §5a.
 - **Credential persistence** via `CredentialStore` — after registration, node_id + node_secret saved to JSON file with 0600 permissions. The gateway registers an `on_register` callback to trigger the save.
-- **Reconnect backoff**: SDK default 1s → 2s → 5s → 10s → 30s (saturating), reset on successful auth
+- **Reconnect backoff**: SDK default 1s → 2s → 5s → 10s → 30s (saturating), reset when an authenticated session is closed cleanly; a session lost to an error, the silence watchdog or the write bound does not reset it, and nor does a successful auth on its own
 - **Multi-URL failover**: rotates through `manager.urls[]` on every WS close
 - **Health heartbeat**: sent every 15 seconds
-- **Command dispatch**: `command` envelopes dispatched into `AppearXCommandHandler::handle_command`; `get_config` is routed through `on_config_request` which returns the consolidated state snapshot and the SDK emits the `config_response` envelope + ack. The SDK calls the handler from its own command worker, one command at a time and never inside the session loop, so an `upgrade_binary` that spends minutes in `UpgradeCoordinator::stage` does not stop the link answering the manager. Past 64 queued commands the SDK refuses the next with `gateway_busy`.
+- **Command dispatch**: `command` envelopes dispatched into `AppearXCommandHandler::handle_command`; `get_config` is routed through `on_config_request` which returns the consolidated state snapshot and the SDK emits the `config_response` envelope + ack. The SDK calls the handler from its own command worker, one command at a time and never inside the session loop, so an `upgrade_binary` that spends minutes in `UpgradeCoordinator::stage` does not stop the link answering the manager. Past 64 queued commands, or 20 MiB of them, the SDK refuses the next with `gateway_busy`.
 
 ### Appear X JSON-RPC Client (`appear_x/jsonrpc.rs`)
 
@@ -267,7 +267,8 @@ deltas that matter here:
   takes a list of up to 16 `wss://` URLs. The gateway delegates
   rotation and reconnect to `bilbycast_gateway_sdk::GatewayClient`;
   the SDK walks the list on every WS close with exponential backoff
-  (1s → 2s → 5s → 10s → 30s, saturating, reset on successful auth).
+  (1s → 2s → 5s → 10s → 30s, saturating, reset when a session is closed
+  cleanly).
   Probe mode (`cargo run -- probe ...`) skips URL validation.
 - **Per-node event rate limit (1000/min).** The manager drops
   excess events silently and synthesises one

@@ -93,7 +93,7 @@ The gateway implements the exact same security model as bilbycast-edge and bilby
    - **Pinned**: SHA-256 fingerprint verification of the server certificate
 3. **Auth as first frame**: Credentials sent in the first WebSocket message, not in URL/headers
 4. **Credential persistence**: After registration, node_id + node_secret saved to a file with 0600 permissions via the SDK's `CredentialStore`
-5. **Reconnect backoff**: SDK-driven exponential backoff (1s → 2s → 5s → 10s → 30s, saturating), reset on successful auth
+5. **Reconnect backoff**: SDK-driven exponential backoff (1s → 2s → 5s → 10s → 30s, saturating), reset when an authenticated session is closed cleanly — not when a session is lost to an error, the silence watchdog or the write bound, nor by a successful auth on its own
 6. **Multi-URL failover**: the SDK rotates through `manager.urls[]` on every WS close
 7. **A bounded link**: every step has a deadline — 30 s for the dial (DNS, TCP, TLS and the upgrade, with Happy-Eyeballs across the manager's addresses), 10 s to write the auth frame, a silence watchdog learned from the manager's pings (never under 90 s), 300 s on every write — so a manager that stalls mid-handshake or stops reading cannot strand the gateway offline until a restart
 
@@ -118,7 +118,7 @@ The SDK exposes:
 - `CommandHandler` trait — the SDK calls it for every `command` envelope from its own command worker, one command at a time and never inside the session loop, so a long command (`upgrade_binary` staging a tarball) does not stop the link answering the manager. The gateway keeps no mpsc+oneshot hop of its own.
 - `CancellationToken` — obtained via `client.shutdown_token()`, wired to ctrl-c in `main`.
 
-Graceful shutdown uses `tokio_util::CancellationToken` — cancelling the token stops the SDK read/write/heartbeat tasks and signals the polling engine (which holds its own clone) to exit.
+Graceful shutdown uses `tokio_util::CancellationToken` — cancelling the token stops the SDK read/write/heartbeat tasks and signals the polling engine (which holds its own clone) to exit. `client.run()` then waits up to 30 s for a command that has already started before it returns and `main` exits, so a Ctrl-C does not cut a command off part-way (the command's ack is not sent).
 
 ## Appear X API Details
 
