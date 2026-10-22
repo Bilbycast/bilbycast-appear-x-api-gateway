@@ -43,7 +43,7 @@ is purely the vendor translation layer on top of that SDK.
 
 1. User clicks an action button in the AI assistant (or sends a command via API)
 2. Manager sends a `command` envelope over WebSocket to the gateway
-3. The SDK read loop dispatches it to `AppearXCommandHandler::handle_command` (or, for `get_config`, to `on_config_request`)
+3. The SDK queues it for its command worker, which calls `AppearXCommandHandler::handle_command` (or, for `get_config`, `on_config_request`) one command at a time, off the loop that reads and writes the socket
 4. Command handler translates the action type to an Appear X JSON-RPC method
 5. JSON-RPC call made to the Appear X unit
 6. The handler returns `Result<Value, CommandError>`; the SDK serialises that into a `command_ack` (preserving `error_code`) and sends it back to the manager
@@ -95,6 +95,7 @@ The gateway implements the exact same security model as bilbycast-edge and bilby
 4. **Credential persistence**: After registration, node_id + node_secret saved to a file with 0600 permissions via the SDK's `CredentialStore`
 5. **Reconnect backoff**: SDK-driven exponential backoff (1s → 2s → 5s → 10s → 30s, saturating), reset on successful auth
 6. **Multi-URL failover**: the SDK rotates through `manager.urls[]` on every WS close
+7. **A bounded link**: every step has a deadline — 30 s for the dial (DNS, TCP, TLS and the upgrade, with Happy-Eyeballs across the manager's addresses), 10 s to write the auth frame, a silence watchdog learned from the manager's pings (never under 90 s), 300 s on every write — so a manager that stalls mid-handshake or stops reading cannot strand the gateway offline until a restart
 
 ### Appear X Connection
 
@@ -114,7 +115,7 @@ main()
 
 The SDK exposes:
 - `Emitter` (cloneable) — the polling engine's outbound channel for stats / health / events / thumbnails / config_responses. Backed by `mpsc::channel<OutboundFrame>(256)` internally.
-- `CommandHandler` trait — the SDK read loop dispatches every `command` envelope directly here; there is no longer a local mpsc+oneshot hop.
+- `CommandHandler` trait — the SDK calls it for every `command` envelope from its own command worker, one command at a time and never inside the session loop, so a long command (`upgrade_binary` staging a tarball) does not stop the link answering the manager. The gateway keeps no mpsc+oneshot hop of its own.
 - `CancellationToken` — obtained via `client.shutdown_token()`, wired to ctrl-c in `main`.
 
 Graceful shutdown uses `tokio_util::CancellationToken` — cancelling the token stops the SDK read/write/heartbeat tasks and signals the polling engine (which holds its own clone) to exit.
